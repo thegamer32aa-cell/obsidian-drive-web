@@ -6,36 +6,39 @@ const PICKER_API_KEY = "AIzaSyCjDY_u3JAEbojhObWjpoTJUDkMF4B089M";
 const ALLOWED_EMAIL = "aimar.aramburu12@gmail.com";
 const SCOPES = "https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email";
 const DRIVE_API = "https://www.googleapis.com/drive/v3";
-
 const FOLDER_MIME = "application/vnd.google-apps.folder";
-const STORAGE_FOLDER_KEY = "ovd_folder"; // { id, name } - no es sensible
+const STORAGE_FOLDER_KEY = "ovd_folder";
 
-let accessToken = null;   // solo en memoria, nunca en localStorage
+let accessToken = null; // solo en memoria
 let tokenClient = null;
 let pickerLoaded = false;
 let currentUserEmail = null;
-let folderStack = []; // [{id, name}]
 
-const main = document.getElementById("main");
-const titleText = document.getElementById("titleText");
-const headerActions = document.getElementById("headerActions");
-const toastHost = document.getElementById("toastHost");
+let rootFolder = null;        // {id, name}
+let filesByPath = new Map();  // path -> {id,name,mimeType,modifiedTime,path,parentPath}
+let nameIndex = new Map();    // nombre en minusculas (sin extension) -> path
+let treeChildren = new Map(); // parentPath ("" = raiz) -> [path,...] ordenado
+
+let currentNote = null;       // {path,id,content,dirty}
+let viewMode = "preview";     // "preview" | "edit"
+let collapsedFolders = new Set();
+
+const $ = (id) => document.getElementById(id);
+const main = $("main");
+const noteTitle = $("noteTitle");
+const topbarActions = $("topbarActions");
+const treeEl = $("tree");
+const vaultNameEl = $("vaultName");
+const sidebar = $("sidebar");
+const scrim = $("scrim");
+const toastHost = $("toastHost");
 
 function toast(msg, isError) {
-  const el = document.createElement("div");
-  el.className = "toast" + (isError ? " error" : "");
-  el.textContent = msg;
-  toastHost.appendChild(el);
-  setTimeout(() => el.remove(), 4000);
-}
-
-function clearHeaderActions() {
-  headerActions.textContent = "";
-}
-
-function setHeaderActions(buttons) {
-  clearHeaderActions();
-  for (const b of buttons) headerActions.appendChild(b);
+  const node = document.createElement("div");
+  node.className = "toast" + (isError ? " error" : "");
+  node.textContent = msg;
+  toastHost.appendChild(node);
+  setTimeout(() => node.remove(), 4000);
 }
 
 function el(tag, opts) {
@@ -43,30 +46,46 @@ function el(tag, opts) {
   if (opts) {
     if (opts.text !== undefined) node.textContent = opts.text;
     if (opts.class) node.className = opts.class;
+    if (opts.title) node.title = opts.title;
     if (opts.onclick) node.addEventListener("click", opts.onclick);
-    if (opts.attrs) for (const k in opts.attrs) node.setAttribute(k, opts.attrs[k]);
   }
   return node;
 }
 
-// ---------------- Pantallas ----------------
+function openSidebar() {
+  sidebar.classList.add("open");
+  scrim.classList.add("show");
+}
+function closeSidebar() {
+  sidebar.classList.remove("open");
+  scrim.classList.remove("show");
+}
+$("sidebarOpenBtn").addEventListener("click", openSidebar);
+$("sidebarCloseBtn").addEventListener("click", closeSidebar);
+scrim.addEventListener("click", closeSidebar);
+
+// ---------------- Pantallas base ----------------
 
 function showLoading(msg) {
-  main.textContent = "";
+  main.innerHTML = "";
   const wrap = el("div", { class: "center-screen" });
   wrap.appendChild(el("div", { class: "spinner" }));
   wrap.appendChild(el("p", { text: msg || "Cargando..." }));
   main.appendChild(wrap);
-  clearHeaderActions();
-  titleText.textContent = "Obsidian Vault";
+  topbarActions.innerHTML = "";
+  noteTitle.textContent = "Obsidian Vault";
 }
 
 function showLogin(errorMsg) {
   accessToken = null;
   currentUserEmail = null;
-  main.textContent = "";
-  clearHeaderActions();
-  titleText.textContent = "Obsidian Vault";
+  sidebar.classList.remove("open");
+  scrim.classList.remove("show");
+  treeEl.innerHTML = "";
+  vaultNameEl.textContent = "Vault";
+  main.innerHTML = "";
+  topbarActions.innerHTML = "";
+  noteTitle.textContent = "Obsidian Vault";
   const wrap = el("div", { class: "center-screen" });
   wrap.appendChild(el("h2", { text: "Acceso a tu vault" }));
   wrap.appendChild(el("p", { text: "Solo la cuenta autorizada de Google puede entrar. El inicio de sesion es gestionado por Google; esta pagina nunca ve tu contrasena." }));
@@ -75,157 +94,21 @@ function showLogin(errorMsg) {
     err.style.color = "var(--danger)";
     wrap.appendChild(err);
   }
-  const btn = el("button", { class: "primary", text: "Iniciar sesion con Google", onclick: () => requestLogin() });
-  wrap.appendChild(btn);
+  wrap.appendChild(el("button", { class: "pill primary", text: "Iniciar sesion con Google", onclick: requestLogin }));
   main.appendChild(wrap);
 }
 
 function showFolderPicker() {
-  main.textContent = "";
-  clearHeaderActions();
-  setHeaderActions([el("button", { text: "Cerrar sesion", onclick: logout })]);
-  titleText.textContent = currentUserEmail || "Obsidian Vault";
+  main.innerHTML = "";
+  topbarActions.innerHTML = "";
+  noteTitle.textContent = "Obsidian Vault";
+  vaultNameEl.textContent = currentUserEmail || "Vault";
+  treeEl.innerHTML = "";
   const wrap = el("div", { class: "center-screen" });
   wrap.appendChild(el("h2", { text: "Elige la carpeta de tu vault" }));
-  wrap.appendChild(el("p", { text: "Selecciona en Google Drive la carpeta que usa Obsidian para sincronizar (por ejemplo \"Obsidian Vault - Trading\")." }));
-  wrap.appendChild(el("button", { class: "primary", text: "Elegir carpeta en Drive", onclick: openPicker }));
+  wrap.appendChild(el("p", { text: 'Selecciona en Google Drive la carpeta que usa Obsidian para sincronizar (ej. "Obsidian Vault - Trading").' }));
+  wrap.appendChild(el("button", { class: "pill primary", text: "Elegir carpeta en Drive", onclick: openPicker }));
   main.appendChild(wrap);
-}
-
-async function showFolderListing(pushToStack) {
-  const current = folderStack[folderStack.length - 1];
-  titleText.textContent = current.name;
-  setHeaderActions([
-    el("button", { text: "Cambiar carpeta", onclick: () => { localStorage.removeItem(STORAGE_FOLDER_KEY); folderStack = []; showFolderPicker(); } }),
-    el("button", { text: "Cerrar sesion", onclick: logout }),
-  ]);
-
-  main.textContent = "";
-
-  if (folderStack.length > 1) {
-    const crumbs = el("div", { class: "breadcrumbs" });
-    folderStack.forEach((f, idx) => {
-      if (idx > 0) crumbs.appendChild(document.createTextNode(" / "));
-      crumbs.appendChild(el("button", {
-        text: f.name,
-        onclick: () => { folderStack = folderStack.slice(0, idx + 1); showFolderListing(); },
-      }));
-    });
-    main.appendChild(crumbs);
-  }
-
-  const loading = el("div", { class: "center-screen" });
-  loading.appendChild(el("div", { class: "spinner" }));
-  main.appendChild(loading);
-
-  try {
-    const items = await listChildren(current.id);
-    main.removeChild(loading);
-    if (items.length === 0) {
-      main.appendChild(el("div", { class: "empty", text: "Carpeta vacia." }));
-      return;
-    }
-    const ul = el("ul", { class: "filelist" });
-    items.sort((a, b) => {
-      const af = a.mimeType === FOLDER_MIME ? 0 : 1;
-      const bf = b.mimeType === FOLDER_MIME ? 0 : 1;
-      if (af !== bf) return af - bf;
-      return a.name.localeCompare(b.name, "es");
-    });
-    for (const item of items) {
-      const li = document.createElement("li");
-      const isFolder = item.mimeType === FOLDER_MIME;
-      const isMd = item.name.toLowerCase().endsWith(".md");
-      const isImg = /\.(png|jpe?g|gif|webp|svg)$/i.test(item.name);
-      const icon = isFolder ? "📁" : isMd ? "📄" : isImg ? "🖼️" : "📎";
-      const btn = el("button", {
-        onclick: () => {
-          if (isFolder) {
-            folderStack.push({ id: item.id, name: item.name });
-            showFolderListing();
-          } else if (isMd) {
-            openEditor(item);
-          } else if (isImg) {
-            openImage(item);
-          } else {
-            window.open(`https://drive.google.com/file/d/${encodeURIComponent(item.id)}/view`, "_blank", "noopener,noreferrer");
-          }
-        },
-      });
-      const iconSpan = el("span", { class: "icon", text: icon });
-      const nameSpan = el("span", { text: item.name });
-      btn.appendChild(iconSpan);
-      btn.appendChild(nameSpan);
-      li.appendChild(btn);
-      ul.appendChild(li);
-    }
-    main.appendChild(ul);
-  } catch (e) {
-    main.removeChild(loading);
-    main.appendChild(el("div", { class: "empty", text: "Error cargando la carpeta: " + e.message }));
-  }
-}
-
-async function openEditor(file) {
-  showLoading("Abriendo " + file.name + "...");
-  titleText.textContent = file.name;
-  try {
-    const content = await downloadText(file.id);
-    main.textContent = "";
-    const wrap = el("div", { class: "editor" });
-    const textarea = document.createElement("textarea");
-    textarea.value = content;
-    wrap.appendChild(textarea);
-    const actions = el("div", { class: "editor-actions" });
-    const backBtn = el("button", { text: "Volver", onclick: () => showFolderListing() });
-    const saveBtn = el("button", {
-      class: "primary",
-      text: "Guardar",
-      onclick: async () => {
-        saveBtn.disabled = true;
-        saveBtn.textContent = "Guardando...";
-        try {
-          await uploadText(file.id, textarea.value);
-          toast("Guardado.");
-        } catch (e) {
-          toast("Error al guardar: " + e.message, true);
-        } finally {
-          saveBtn.disabled = false;
-          saveBtn.textContent = "Guardar";
-        }
-      },
-    });
-    actions.appendChild(backBtn);
-    actions.appendChild(saveBtn);
-    wrap.appendChild(actions);
-    main.appendChild(wrap);
-    setHeaderActions([el("button", { text: "Cerrar sesion", onclick: logout })]);
-  } catch (e) {
-    main.textContent = "";
-    main.appendChild(el("div", { class: "empty", text: "Error abriendo el archivo: " + e.message }));
-  }
-}
-
-async function openImage(file) {
-  showLoading("Cargando imagen...");
-  titleText.textContent = file.name;
-  try {
-    const blob = await downloadBlob(file.id);
-    const url = URL.createObjectURL(blob);
-    main.textContent = "";
-    const wrap = el("div", { class: "center-screen" });
-    const img = document.createElement("img");
-    img.src = url;
-    img.style.maxWidth = "100%";
-    img.style.borderRadius = "8px";
-    wrap.appendChild(img);
-    wrap.appendChild(el("button", { text: "Volver", onclick: () => { URL.revokeObjectURL(url); showFolderListing(); } }));
-    main.appendChild(wrap);
-    setHeaderActions([el("button", { text: "Cerrar sesion", onclick: logout })]);
-  } catch (e) {
-    main.textContent = "";
-    main.appendChild(el("div", { class: "empty", text: "Error cargando la imagen: " + e.message }));
-  }
 }
 
 // ---------------- Auth ----------------
@@ -244,8 +127,6 @@ function initGoogle() {
 }
 
 function requestLogin() {
-  // El popup de Google debe abrirse de forma sincrona dentro del gesto de toque/click,
-  // sin nada de por medio (Safari/iOS es especialmente estricto con esto).
   tokenClient.requestAccessToken({ prompt: "" });
   showLoading("Conectando con Google...");
 }
@@ -277,8 +158,8 @@ async function onTokenResponse(resp) {
 
   const saved = safeParse(localStorage.getItem(STORAGE_FOLDER_KEY));
   if (saved && saved.id && saved.name) {
-    folderStack = [{ id: saved.id, name: saved.name }];
-    showFolderListing();
+    rootFolder = saved;
+    loadVault();
   } else {
     showFolderPicker();
   }
@@ -288,9 +169,7 @@ function revokeToken() {
   if (accessToken && window.google && google.accounts && google.accounts.oauth2) {
     try {
       google.accounts.oauth2.revoke(accessToken, () => {});
-    } catch (e) {
-      /* ignore */
-    }
+    } catch (e) {}
   }
   accessToken = null;
 }
@@ -298,7 +177,7 @@ function revokeToken() {
 function logout() {
   revokeToken();
   currentUserEmail = null;
-  folderStack = [];
+  currentNote = null;
   showLogin();
 }
 
@@ -315,7 +194,7 @@ function safeParse(s) {
 function ensurePickerLoaded() {
   return new Promise((resolve, reject) => {
     if (pickerLoaded) return resolve();
-    if (!window.gapi) return reject(new Error("Google API no disponible todavia, espera unos segundos e intenta de nuevo."));
+    if (!window.gapi) return reject(new Error("Google API no disponible todavia, intenta de nuevo en unos segundos."));
     gapi.load("picker", {
       callback: () => {
         pickerLoaded = true;
@@ -346,24 +225,28 @@ async function openPicker() {
     .setCallback((data) => {
       if (data.action === google.picker.Action.PICKED) {
         const doc = data.docs[0];
-        const folder = { id: doc.id, name: doc.name };
-        localStorage.setItem(STORAGE_FOLDER_KEY, JSON.stringify(folder));
-        folderStack = [folder];
-        showFolderListing();
+        rootFolder = { id: doc.id, name: doc.name };
+        localStorage.setItem(STORAGE_FOLDER_KEY, JSON.stringify(rootFolder));
+        loadVault();
       }
     })
     .build();
   picker.setVisible(true);
 }
 
+function changeFolder() {
+  localStorage.removeItem(STORAGE_FOLDER_KEY);
+  rootFolder = null;
+  currentNote = null;
+  showFolderPicker();
+}
+$("changeFolderBtn").addEventListener("click", changeFolder);
+
 // ---------------- Drive REST ----------------
 
 async function driveFetch(url, opts) {
   opts = opts || {};
-  const res = await fetch(url, {
-    ...opts,
-    headers: { Authorization: "Bearer " + accessToken, ...(opts.headers || {}) },
-  });
+  const res = await fetch(url, { ...opts, headers: { Authorization: "Bearer " + accessToken, ...(opts.headers || {}) } });
   if (res.status === 401) {
     revokeToken();
     showLogin("Tu sesion caduco, inicia sesion de nuevo.");
@@ -376,12 +259,18 @@ async function driveFetch(url, opts) {
   return res;
 }
 
-async function listChildren(folderId) {
-  const q = encodeURIComponent(`'${folderId}' in parents and trashed=false`);
-  const url = `${DRIVE_API}/files?q=${q}&fields=files(id,name,mimeType,modifiedTime)&pageSize=1000`;
-  const res = await driveFetch(url);
-  const data = await res.json();
-  return data.files || [];
+async function listChildrenOf(folderId) {
+  const out = [];
+  let pageToken;
+  do {
+    const q = encodeURIComponent(`'${folderId}' in parents and trashed=false`);
+    const params = `q=${q}&fields=nextPageToken,files(id,name,mimeType,modifiedTime)&pageSize=1000` + (pageToken ? `&pageToken=${pageToken}` : "");
+    const res = await driveFetch(`${DRIVE_API}/files?${params}`);
+    const data = await res.json();
+    out.push(...(data.files || []));
+    pageToken = data.nextPageToken;
+  } while (pageToken);
+  return out;
 }
 
 async function downloadText(fileId) {
@@ -401,6 +290,349 @@ async function uploadText(fileId, text) {
     body: text,
   });
 }
+
+// ---------------- Construir arbol completo del vault ----------------
+
+async function loadVault() {
+  showLoading("Leyendo tu vault...");
+  filesByPath = new Map();
+  nameIndex = new Map();
+  treeChildren = new Map();
+  treeChildren.set("", []);
+
+  try {
+    const queue = [{ id: rootFolder.id, path: "" }];
+    while (queue.length) {
+      const { id, path } = queue.shift();
+      const children = await listChildrenOf(id);
+      children.sort((a, b) => {
+        const af = a.mimeType === FOLDER_MIME ? 0 : 1;
+        const bf = b.mimeType === FOLDER_MIME ? 0 : 1;
+        if (af !== bf) return af - bf;
+        return a.name.localeCompare(b.name, "es");
+      });
+      for (const child of children) {
+        const childPath = path ? path + "/" + child.name : child.name;
+        const isFolder = child.mimeType === FOLDER_MIME;
+        filesByPath.set(childPath, {
+          id: child.id,
+          name: child.name,
+          mimeType: child.mimeType,
+          modifiedTime: child.modifiedTime,
+          path: childPath,
+          parentPath: path,
+          isFolder,
+        });
+        treeChildren.get(path).push(childPath);
+        if (isFolder) {
+          treeChildren.set(childPath, []);
+          queue.push({ id: child.id, path: childPath });
+        } else {
+          const base = child.name.replace(/\.[^.]+$/, "").toLowerCase();
+          if (!nameIndex.has(base)) nameIndex.set(base, childPath);
+        }
+      }
+    }
+  } catch (e) {
+    main.innerHTML = "";
+    main.appendChild(el("div", { class: "empty", text: "Error leyendo el vault: " + e.message }));
+    return;
+  }
+
+  vaultNameEl.textContent = rootFolder.name;
+  $("sidebarEmail").textContent = currentUserEmail || "";
+  renderTree();
+  main.innerHTML = "";
+  topbarActions.innerHTML = "";
+  const wrap = el("div", { class: "center-screen" });
+  wrap.appendChild(el("p", { text: "Selecciona una nota del menu para empezar." }));
+  main.appendChild(wrap);
+  noteTitle.textContent = rootFolder.name;
+}
+
+// ---------------- Sidebar / arbol ----------------
+
+function renderTree() {
+  treeEl.innerHTML = "";
+  const rootChildren = treeChildren.get("") || [];
+  for (const path of rootChildren) {
+    treeEl.appendChild(buildTreeNode(path));
+  }
+}
+
+function buildTreeNode(path) {
+  const file = filesByPath.get(path);
+  const item = el("div", { class: "tree-item" });
+  const row = el("div", { class: "tree-row" });
+
+  if (file.isFolder) {
+    const collapsed = collapsedFolders.has(path);
+    row.classList.toggle("collapsed", collapsed);
+    row.appendChild(el("span", { class: "chev", text: "▾" }));
+    row.appendChild(el("span", { class: "name", text: "📁 " + file.name }));
+    const childrenWrap = el("div", { class: "tree-children" + (collapsed ? " hidden" : "") });
+    for (const childPath of treeChildren.get(path) || []) {
+      childrenWrap.appendChild(buildTreeNode(childPath));
+    }
+    row.addEventListener("click", () => {
+      const nowCollapsed = childrenWrap.classList.toggle("hidden");
+      row.classList.toggle("collapsed", nowCollapsed);
+      if (nowCollapsed) collapsedFolders.add(path);
+      else collapsedFolders.delete(path);
+    });
+    item.appendChild(row);
+    item.appendChild(childrenWrap);
+  } else {
+    const isMd = file.name.toLowerCase().endsWith(".md");
+    const icon = isMd ? "📄" : /\.(png|jpe?g|gif|webp|svg)$/i.test(file.name) ? "🖼️" : "📎";
+    row.appendChild(el("span", { class: "chev", text: "" }));
+    row.appendChild(el("span", { class: "name", text: icon + " " + file.name.replace(/\.md$/i, "") }));
+    row.addEventListener("click", () => {
+      closeSidebar();
+      if (isMd) openNote(path);
+      else openOther(path);
+    });
+    item.appendChild(row);
+  }
+  return item;
+}
+
+// ---------------- Ver / editar nota ----------------
+
+async function openNote(path) {
+  const file = filesByPath.get(path);
+  if (!file) {
+    toast("Nota no encontrada: " + path, true);
+    return;
+  }
+  showLoading("Abriendo " + file.name + "...");
+  try {
+    const content = await downloadText(file.id);
+    currentNote = { path, id: file.id, content, dirty: false };
+    viewMode = "preview";
+    renderNote();
+  } catch (e) {
+    main.innerHTML = "";
+    main.appendChild(el("div", { class: "empty", text: "Error abriendo la nota: " + e.message }));
+  }
+}
+
+async function openOther(path) {
+  const file = filesByPath.get(path);
+  const isImg = /\.(png|jpe?g|gif|webp|svg)$/i.test(file.name);
+  noteTitle.textContent = file.name;
+  topbarActions.innerHTML = "";
+  if (isImg) {
+    showLoading("Cargando imagen...");
+    try {
+      const blob = await downloadBlob(file.id);
+      const url = URL.createObjectURL(blob);
+      main.innerHTML = "";
+      const wrap = el("div", { class: "center-screen" });
+      const img = document.createElement("img");
+      img.src = url;
+      img.style.maxWidth = "100%";
+      img.style.borderRadius = "8px";
+      wrap.appendChild(img);
+      main.appendChild(wrap);
+    } catch (e) {
+      main.innerHTML = "";
+      main.appendChild(el("div", { class: "empty", text: "Error cargando la imagen: " + e.message }));
+    }
+  } else {
+    main.innerHTML = "";
+    const wrap = el("div", { class: "center-screen" });
+    wrap.appendChild(el("p", { text: "Este tipo de archivo no se puede previsualizar aqui." }));
+    wrap.appendChild(el("a", { text: "Abrir en Google Drive" }));
+    wrap.querySelector("a").href = `https://drive.google.com/file/d/${encodeURIComponent(file.id)}/view`;
+    wrap.querySelector("a").target = "_blank";
+    wrap.querySelector("a").rel = "noopener noreferrer";
+    main.appendChild(wrap);
+  }
+}
+
+function renderNote() {
+  if (!currentNote) return;
+  const file = filesByPath.get(currentNote.path);
+  noteTitle.textContent = file.name.replace(/\.md$/i, "") + (currentNote.dirty ? " •" : "");
+
+  topbarActions.innerHTML = "";
+  if (viewMode === "preview") {
+    topbarActions.appendChild(el("button", { class: "icon-btn", title: "Editar", text: "✏️", onclick: () => { viewMode = "edit"; renderNote(); } }));
+  } else {
+    topbarActions.appendChild(el("button", { class: "icon-btn", title: "Vista previa", text: "👁️", onclick: () => { viewMode = "preview"; renderNote(); } }));
+    const saveBtn = el("button", { class: "pill primary", text: "Guardar", onclick: () => saveCurrentNote(saveBtn) });
+    saveBtn.disabled = !currentNote.dirty;
+    topbarActions.appendChild(saveBtn);
+  }
+
+  main.innerHTML = "";
+  const wrap = el("div", { class: "note-wrap" });
+
+  if (viewMode === "edit") {
+    const textarea = document.createElement("textarea");
+    textarea.value = currentNote.content;
+    textarea.addEventListener("input", () => {
+      currentNote.content = textarea.value;
+      currentNote.dirty = true;
+      noteTitle.textContent = file.name.replace(/\.md$/i, "") + " •";
+      const saveBtn = topbarActions.querySelector("button.primary");
+      if (saveBtn) saveBtn.disabled = false;
+    });
+    wrap.appendChild(textarea);
+  } else {
+    const div = el("div", { class: "md" });
+    const pendingImages = [];
+    let embedCounter = 0;
+    const ctx = {
+      onWikilink: (target, alias) => renderWikilink(target, alias),
+      onEmbed: (target, alias) => renderEmbed(target, alias, pendingImages, () => embedCounter++),
+      onImage: (url, alt) => renderInlineImage(url, alt, pendingImages, () => embedCounter++, currentNote.path),
+    };
+    div.innerHTML = renderMarkdown(currentNote.content, ctx);
+    wrap.appendChild(div);
+
+    div.addEventListener("click", (ev) => {
+      const a = ev.target.closest("a[data-open]");
+      if (a) {
+        ev.preventDefault();
+        openNote(a.getAttribute("data-open"));
+      }
+    });
+    div.addEventListener("change", (ev) => {
+      const cb = ev.target.closest('input[type="checkbox"][data-line]');
+      if (cb) toggleCheckboxLine(Number(cb.getAttribute("data-line")), cb.checked);
+    });
+
+    resolvePendingImages(pendingImages);
+  }
+
+  main.appendChild(wrap);
+}
+
+function renderWikilink(target, alias) {
+  const path = nameIndex.get(target.toLowerCase());
+  const label = mdEscapeHtml(alias || target);
+  if (!path) return `<a href="#" class="wikilink broken" title="Nota no encontrada">${label}</a>`;
+  return `<a href="#" class="wikilink" data-open="${mdEscapeHtml(path)}">${label}</a>`;
+}
+
+function renderEmbed(target, alias, pendingImages, nextId) {
+  const path = nameIndex.get(target.toLowerCase()) || (filesByPath.has(target) ? target : null);
+  if (!path) return `<span class="embed-missing">[[${mdEscapeHtml(target)}]] no encontrada</span>`;
+  const file = filesByPath.get(path);
+  if (/\.(png|jpe?g|gif|webp|svg)$/i.test(file.name)) {
+    const holderId = "embed-img-" + nextId();
+    pendingImages.push({ holderId, fileId: file.id });
+    return `<span class="embed-missing" id="${holderId}">Cargando ${mdEscapeHtml(file.name)}...</span>`;
+  }
+  const label = mdEscapeHtml(alias || file.name.replace(/\.md$/i, ""));
+  return `<a href="#" class="wikilink" data-open="${mdEscapeHtml(path)}">🔗 ${label}</a>`;
+}
+
+function renderInlineImage(url, alt, pendingImages, nextId, currentPath) {
+  const decoded = decodeURIComponent(url);
+  let file = filesByPath.get(decoded);
+  if (!file) {
+    const baseDir = currentPath.includes("/") ? currentPath.slice(0, currentPath.lastIndexOf("/")) : "";
+    const joined = baseDir ? baseDir + "/" + decoded : decoded;
+    file = filesByPath.get(joined);
+  }
+  if (!file) {
+    const base = decoded.split("/").pop().replace(/\.[^.]+$/, "").toLowerCase();
+    const p = nameIndex.get(base);
+    if (p) file = filesByPath.get(p);
+  }
+  if (!file) return `<span class="embed-missing">imagen no encontrada: ${mdEscapeHtml(decoded)}</span>`;
+  const holderId = "embed-img-" + nextId();
+  pendingImages.push({ holderId, fileId: file.id, alt });
+  return `<span class="embed-missing" id="${holderId}">Cargando imagen...</span>`;
+}
+
+async function resolvePendingImages(pending) {
+  for (const p of pending) {
+    try {
+      const blob = await downloadBlob(p.fileId);
+      const url = URL.createObjectURL(blob);
+      const holder = document.getElementById(p.holderId);
+      if (!holder) continue;
+      const img = document.createElement("img");
+      img.src = url;
+      img.alt = p.alt || "";
+      holder.replaceWith(img);
+    } catch (e) {
+      const holder = document.getElementById(p.holderId);
+      if (holder) holder.textContent = "No se pudo cargar la imagen.";
+    }
+  }
+}
+
+function toggleCheckboxLine(lineIndex, checked) {
+  const lines = currentNote.content.split("\n");
+  if (lineIndex < 0 || lineIndex >= lines.length) return;
+  lines[lineIndex] = lines[lineIndex].replace(/\[( |x|X)\]/, checked ? "[x]" : "[ ]");
+  currentNote.content = lines.join("\n");
+  currentNote.dirty = true;
+  saveCurrentNote(null);
+}
+
+async function saveCurrentNote(btn) {
+  if (!currentNote) return;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Guardando...";
+  }
+  try {
+    await uploadText(currentNote.id, currentNote.content);
+    currentNote.dirty = false;
+    const file = filesByPath.get(currentNote.path);
+    if (file) file.modifiedTime = new Date().toISOString();
+    toast("Guardado.");
+    renderNote();
+  } catch (e) {
+    toast("Error al guardar: " + e.message, true);
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Guardar";
+    }
+  }
+}
+
+// ---------------- Busqueda ----------------
+
+$("searchInput").addEventListener("input", (ev) => {
+  const q = ev.target.value.trim().toLowerCase();
+  if (!q) {
+    renderTree();
+    return;
+  }
+  treeEl.innerHTML = "";
+  const matches = [...filesByPath.values()]
+    .filter((f) => !f.isFolder && f.name.toLowerCase().includes(q))
+    .sort((a, b) => a.name.localeCompare(b.name, "es"));
+  if (matches.length === 0) {
+    treeEl.appendChild(el("div", { class: "empty", text: "Sin resultados." }));
+    return;
+  }
+  for (const f of matches) {
+    const row = el("div", { class: "tree-row" });
+    const icon = f.name.toLowerCase().endsWith(".md") ? "📄" : "📎";
+    row.appendChild(el("span", { class: "chev", text: "" }));
+    row.appendChild(el("span", { class: "name", text: icon + " " + f.path }));
+    row.addEventListener("click", () => {
+      closeSidebar();
+      ev.target.value = "";
+      renderTree();
+      if (f.name.toLowerCase().endsWith(".md")) openNote(f.path);
+      else openOther(f.path);
+    });
+    treeEl.appendChild(row);
+  }
+});
+
+// ---------------- Sesion ----------------
+
+$("logoutBtn").addEventListener("click", logout);
 
 // ---------------- Arranque ----------------
 
