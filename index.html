@@ -6,7 +6,7 @@
 <meta name="referrer" content="strict-origin-when-cross-origin">
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'none';
-  script-src 'self' https://accounts.google.com https://apis.google.com;
+  script-src 'self' 'unsafe-inline' https://accounts.google.com https://apis.google.com;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   connect-src 'self' https://www.googleapis.com https://oauth2.googleapis.com https://accounts.google.com;
@@ -15,7 +15,133 @@
   form-action 'none';
 ">
 <title>Obsidian Vault (Drive)</title>
-<link rel="stylesheet" href="style.css">
+<style>
+:root{
+  --bg:#1e1e1e; --bg-secondary:#161616; --bg-elevated:#262626;
+  --border:#2e2e2e; --fg:#dcddde; --muted:#8a8a8a;
+  --accent:#7c6cf0; --accent-fg:#ffffff;
+  --danger:#e5534b; --ok:#3fb950;
+  --sidebar-w:280px; --topbar-h:52px;
+}
+*{box-sizing:border-box;}
+html,body{margin:0;padding:0;height:100%;background:var(--bg);color:var(--fg);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;}
+button{font:inherit;}
+#app{display:flex;height:100%;}
+
+#sidebar{
+  width:var(--sidebar-w);flex-shrink:0;background:var(--bg-secondary);
+  border-right:1px solid var(--border);display:flex;flex-direction:column;
+  position:fixed;inset:0 auto 0 0;z-index:20;transform:translateX(-100%);transition:transform .2s ease;
+  padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom);
+}
+#sidebar.open{transform:translateX(0);}
+.sidebar-header{display:flex;align-items:center;gap:8px;padding:12px 10px;border-bottom:1px solid var(--border);}
+.vault-name{flex:1;font-weight:600;font-size:.9rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.sidebar-search{padding:8px 10px;border-bottom:1px solid var(--border);}
+.sidebar-search input{width:100%;background:var(--bg-elevated);border:1px solid var(--border);color:var(--fg);
+  border-radius:6px;padding:8px 10px;font-size:.85rem;}
+.tree{flex:1;overflow-y:auto;padding:6px;}
+.sidebar-footer{display:flex;align-items:center;justify-content:space-between;gap:6px;
+  padding:8px 10px;border-top:1px solid var(--border);font-size:.75rem;color:var(--muted);}
+#sidebarEmail{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#scrim{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:15;display:none;}
+#scrim.show{display:block;}
+
+.tree-item{border-radius:6px;}
+.tree-row{display:flex;align-items:center;gap:6px;padding:6px 8px;cursor:pointer;border-radius:6px;
+  font-size:.85rem;color:var(--fg);user-select:none;}
+.tree-row:hover{background:var(--bg-elevated);}
+.tree-row .chev{width:14px;flex-shrink:0;text-align:center;color:var(--muted);font-size:.7rem;transition:transform .15s;}
+.tree-row.collapsed .chev{transform:rotate(-90deg);}
+.tree-row .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;}
+.tree-children{margin-left:14px;display:block;}
+.tree-children.hidden{display:none;}
+
+#contentCol{flex:1;display:flex;flex-direction:column;min-width:0;height:100%;}
+#topbar{
+  min-height:var(--topbar-h);flex-shrink:0;display:flex;align-items:center;gap:6px;padding:6px 8px;
+  border-bottom:1px solid var(--border);background:var(--bg);
+  padding-top:calc(env(safe-area-inset-top) + 6px);position:sticky;top:0;z-index:5;
+}
+#topbarActions{display:flex;gap:6px;flex-shrink:0;}
+.icon-btn{background:none;border:1px solid transparent;color:var(--fg);border-radius:6px;
+  width:36px;height:36px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:1.05rem;cursor:pointer;}
+.icon-btn:hover{background:var(--bg-elevated);}
+.only-mobile{display:none;}
+
+.tabbar{flex:1;display:flex;gap:4px;overflow-x:auto;scrollbar-width:none;min-width:0;}
+.tabbar::-webkit-scrollbar{display:none;}
+.tab{display:flex;align-items:center;gap:6px;padding:7px 8px 7px 12px;border-radius:6px;
+  background:var(--bg-elevated);border:1px solid transparent;font-size:.8rem;white-space:nowrap;
+  cursor:pointer;flex-shrink:0;max-width:200px;color:var(--muted);}
+.tab.active{border-color:var(--accent);color:var(--fg);}
+.tab .tab-name{overflow:hidden;text-overflow:ellipsis;}
+.tab.dirty .tab-name::after{content:" \2022";color:var(--accent);}
+.tab .tab-close{opacity:.55;padding:0 2px;border-radius:4px;}
+.tab .tab-close:hover{opacity:1;background:var(--bg);}
+
+button.pill{background:var(--bg-elevated);border:1px solid var(--border);color:var(--fg);
+  border-radius:8px;padding:8px 14px;cursor:pointer;font-size:.85rem;}
+button.pill.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-fg);}
+button.pill:disabled{opacity:.5;}
+
+#main{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;}
+.center-screen{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:24px;text-align:center;}
+.center-screen p{color:var(--muted);max-width:340px;line-height:1.5;font-size:.9rem;}
+.spinner{width:28px;height:28px;border-radius:50%;border:3px solid var(--border);border-top-color:var(--accent);animation:spin .8s linear infinite;}
+@keyframes spin{to{transform:rotate(360deg);}}
+.empty{color:var(--muted);text-align:center;padding:40px 20px;font-size:.9rem;}
+
+.note-wrap{max-width:760px;margin:0 auto;padding:20px 20px 80px;}
+.note-wrap textarea{
+  width:100%;min-height:70vh;background:var(--bg-secondary);color:var(--fg);
+  border:1px solid var(--border);border-radius:8px;padding:14px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.9rem;line-height:1.6;resize:vertical;
+}
+
+.md h1,.md h2,.md h3,.md h4{line-height:1.3;margin:1.4em 0 .5em;}
+.md h1{font-size:1.7em;border-bottom:1px solid var(--border);padding-bottom:.2em;}
+.md h2{font-size:1.4em;}
+.md h3{font-size:1.2em;}
+.md h4{font-size:1.05em;color:var(--muted);}
+.md p{line-height:1.65;margin:.7em 0;}
+.md a{color:var(--accent);text-decoration:none;}
+.md a:hover{text-decoration:underline;}
+.md a.wikilink{border-bottom:1px dotted var(--accent);}
+.md a.wikilink.broken{color:var(--danger);border-bottom-color:var(--danger);}
+.md code{background:var(--bg-elevated);padding:.15em .35em;border-radius:4px;font-size:.85em;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}
+.md pre{background:var(--bg-secondary);border:1px solid var(--border);padding:12px 14px;border-radius:8px;overflow-x:auto;}
+.md pre code{background:none;padding:0;}
+.md blockquote{border-left:3px solid var(--accent);margin:.8em 0;padding:.2em 1em;color:var(--muted);}
+.md ul,.md ol{padding-left:1.4em;margin:.5em 0;line-height:1.6;}
+.md li{margin:.2em 0;}
+.md li.task{list-style:none;margin-left:-1.4em;display:flex;align-items:flex-start;gap:.4em;}
+.md li.task input{margin-top:.35em;}
+.md hr{border:none;border-top:1px solid var(--border);margin:1.6em 0;}
+.md table{border-collapse:collapse;width:100%;margin:1em 0;font-size:.9em;}
+.md th,.md td{border:1px solid var(--border);padding:.4em .6em;text-align:left;}
+.md th{background:var(--bg-secondary);}
+.md img{max-width:100%;border-radius:6px;}
+.md .embed-missing{color:var(--muted);font-style:italic;font-size:.85em;}
+.chart-wrap{background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;
+  padding:14px;margin:1em 0;position:relative;height:320px;}
+
+.toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--bg-elevated);
+  border:1px solid var(--border);color:var(--fg);padding:10px 16px;border-radius:8px;font-size:.85rem;
+  z-index:50;max-width:90vw;box-shadow:0 4px 16px rgba(0,0,0,.4);}
+.toast.error{border-color:var(--danger);}
+
+@media (min-width:860px){
+  #sidebar{position:static;transform:none;}
+  #scrim{display:none !important;}
+  .only-mobile{display:none !important;}
+}
+@media (max-width:859.98px){
+  .only-mobile{display:flex;}
+  #contentCol{width:100%;}
+}
+</style>
 </head>
 <body>
 
@@ -41,7 +167,7 @@
   <div id="contentCol">
     <header id="topbar">
       <button id="sidebarOpenBtn" class="icon-btn only-mobile" aria-label="Menu">☰</button>
-      <div id="noteTitle">Obsidian Vault</div>
+      <div id="tabbar" class="tabbar"></div>
       <div id="topbarActions"></div>
     </header>
     <main id="main">
@@ -57,8 +183,869 @@
 
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <script src="https://apis.google.com/js/api.js" async defer></script>
+<script src="chart.umd.min.js"></script>
 
-<script src="markdown.js"></script>
-<script src="app.js"></script>
+<script>
+"use strict";
+/* =========================================================================
+   Obsidian Vault (Drive) - todo en un solo archivo (HTML + CSS + JS).
+   Unica dependencia externa vendorizada: chart.umd.min.js (Chart.js, MIT).
+   ========================================================================= */
+
+/* ---------------------------------------------------------------------
+   1) Motor de Markdown propio (estilo Obsidian): encabezados, listas,
+   tareas clicables, tablas, citas, codigo, [[wikilinks]], ![[embeds]]
+   y bloques ```chart renderizados con Chart.js.
+   Todo el texto se escapa antes de insertar cualquier etiqueta, para que
+   un nombre de nota "raro" nunca pueda inyectar HTML.
+--------------------------------------------------------------------- */
+
+function mdEscapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function mdSanitizeUrl(url) {
+  const t = (url || "").trim();
+  if (/^(https?:|mailto:)/i.test(t)) return t;
+  if (/^[a-zA-Z0-9._\-/%# ]+$/.test(t)) return t;
+  return "#";
+}
+
+function mdRenderInline(text, ctx) {
+  let out = mdEscapeHtml(text);
+
+  const codeTokens = [];
+  out = out.replace(/`([^`]+)`/g, (m, code) => {
+    const idx = codeTokens.push(code) - 1;
+    return ` CODE${idx} `;
+  });
+
+  out = out.replace(/!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (m, target, alias) => ctx.onEmbed(target.trim(), alias ? alias.trim() : null));
+  out = out.replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (m, target, alias) => ctx.onWikilink(target.trim(), alias ? alias.trim() : null));
+  out = out.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (m, alt, url) => ctx.onImage(mdSanitizeUrl(mdDecodeEntitiesLite(url)), alt));
+  out = out.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (m, label, url) => {
+    const safe = mdSanitizeUrl(mdDecodeEntitiesLite(url));
+    return `<a href="${safe}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+  });
+
+  out = out.replace(/\*\*\*([^*]+)\*\*\*/g, "<strong><em>$1</em></strong>");
+  out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  out = out.replace(/__([^_]+)__/g, "<strong>$1</strong>");
+  out = out.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+  out = out.replace(/(^|[^_])_([^_\n]+)_/g, "$1<em>$2</em>");
+  out = out.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+
+  out = out.replace(/ CODE(\d+) /g, (m, i) => `<code>${mdEscapeHtml(codeTokens[Number(i)])}</code>`);
+  return out;
+}
+
+function mdDecodeEntitiesLite(s) {
+  return s.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"');
+}
+
+function renderMarkdown(source, ctx) {
+  const lines = source.replace(/\r\n/g, "\n").split("\n");
+  const html = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    const fence = line.match(/^```(.*)$/);
+    if (fence) {
+      const lang = fence[1].trim();
+      const codeLines = [];
+      i++;
+      while (i < lines.length && !/^```\s*$/.test(lines[i])) {
+        codeLines.push(lines[i]);
+        i++;
+      }
+      i++;
+      if (lang.toLowerCase() === "chart") {
+        html.push(ctx.onChart(codeLines.join("\n")));
+      } else {
+        html.push(`<pre><code${lang ? ` data-lang="${mdEscapeHtml(lang)}"` : ""}>${mdEscapeHtml(codeLines.join("\n"))}</code></pre>`);
+      }
+      continue;
+    }
+
+    if (/^\s*$/.test(line)) { i++; continue; }
+
+    if (/^(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) { html.push("<hr>"); i++; continue; }
+
+    const heading = line.match(/^(#{1,6})\s+(.*)$/);
+    if (heading) {
+      const level = heading[1].length;
+      html.push(`<h${level}>${mdRenderInline(heading[2].trim(), ctx)}</h${level}>`);
+      i++;
+      continue;
+    }
+
+    if (/^>\s?/.test(line)) {
+      const buf = [];
+      while (i < lines.length && /^>\s?/.test(lines[i])) { buf.push(lines[i].replace(/^>\s?/, "")); i++; }
+      html.push(`<blockquote>${mdRenderInline(buf.join(" "), ctx)}</blockquote>`);
+      continue;
+    }
+
+    if (/^\|.*\|\s*$/.test(line) && lines[i + 1] && /^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(lines[i + 1])) {
+      const headerCells = splitTableRow(line);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && /^\|.*\|\s*$/.test(lines[i])) { rows.push(splitTableRow(lines[i])); i++; }
+      let t = "<table><thead><tr>";
+      for (const c of headerCells) t += `<th>${mdRenderInline(c, ctx)}</th>`;
+      t += "</tr></thead><tbody>";
+      for (const r of rows) { t += "<tr>"; for (const c of r) t += `<td>${mdRenderInline(c, ctx)}</td>`; t += "</tr>"; }
+      t += "</tbody></table>";
+      html.push(t);
+      continue;
+    }
+
+    const listMatch = line.match(/^(\s*)([-*+]|\d+\.)\s+(.*)$/);
+    if (listMatch) {
+      const ordered = /\d+\./.test(listMatch[2]);
+      const items = [];
+      while (i < lines.length) {
+        const m = lines[i].match(/^(\s*)([-*+]|\d+\.)\s+(.*)$/);
+        if (!m) break;
+        items.push({ text: m[3], lineIndex: i });
+        i++;
+      }
+      let l = ordered ? "<ol>" : "<ul>";
+      for (const item of items) {
+        const task = item.text.match(/^\[( |x|X)\]\s+(.*)$/);
+        if (task) {
+          const checked = task[1].toLowerCase() === "x";
+          const cid = `cb-${item.lineIndex}`;
+          l += `<li class="task"><input type="checkbox" id="${cid}" data-line="${item.lineIndex}" ${checked ? "checked" : ""}> <label for="${cid}">${mdRenderInline(task[2], ctx)}</label></li>`;
+        } else {
+          l += `<li>${mdRenderInline(item.text, ctx)}</li>`;
+        }
+      }
+      l += ordered ? "</ol>" : "</ul>";
+      html.push(l);
+      continue;
+    }
+
+    const buf = [line.trim()];
+    i++;
+    while (
+      i < lines.length && !/^\s*$/.test(lines[i]) && !/^#{1,6}\s/.test(lines[i]) && !/^```/.test(lines[i]) &&
+      !/^>\s?/.test(lines[i]) && !/^(\s*)([-*+]|\d+\.)\s+/.test(lines[i]) && !/^(-{3,}|\*{3,}|_{3,})\s*$/.test(lines[i])
+    ) { buf.push(lines[i].trim()); i++; }
+    html.push(`<p>${mdRenderInline(buf.join(" "), ctx)}</p>`);
+  }
+
+  return html.join("\n");
+}
+
+function splitTableRow(line) {
+  let l = line.trim();
+  if (l.startsWith("|")) l = l.slice(1);
+  if (l.endsWith("|")) l = l.slice(0, -1);
+  return l.split("|").map((c) => c.trim());
+}
+
+/* ---------------------------------------------------------------------
+   2) Parser YAML-ish minimo, solo para el formato de bloques ```chart
+   (compatible con el plugin "obsidian-charts": type/labels/series/...).
+--------------------------------------------------------------------- */
+
+function parseChartYaml(text) {
+  const rawLines = text.replace(/\r\n/g, "\n").split("\n").filter((l) => l.trim() !== "");
+  let i = 0;
+  const indentOf = (l) => l.match(/^ */)[0].length;
+
+  function parseScalar(s) {
+    s = s.trim();
+    if (s === "" || s === "null" || s === "~") return null;
+    if (s === "true") return true;
+    if (s === "false") return false;
+    if (/^-?\d+(\.\d+)?$/.test(s)) return Number(s);
+    if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) return s.slice(1, -1);
+    return s;
+  }
+  function splitTopLevelCommas(s) {
+    const parts = [];
+    let depth = 0, cur = "", inQ = false, qc = "";
+    for (const ch of s) {
+      if (inQ) { cur += ch; if (ch === qc) inQ = false; continue; }
+      if (ch === '"' || ch === "'") { inQ = true; qc = ch; cur += ch; continue; }
+      if (ch === "[") depth++;
+      if (ch === "]") depth--;
+      if (ch === "," && depth === 0) { parts.push(cur); cur = ""; continue; }
+      cur += ch;
+    }
+    if (cur.trim() !== "") parts.push(cur);
+    return parts.map((p) => p.trim());
+  }
+  function parseValue(s) {
+    s = s.trim();
+    if (s.startsWith("[") && s.endsWith("]")) return splitTopLevelCommas(s.slice(1, -1)).map(parseScalar);
+    return parseScalar(s);
+  }
+  function parseBlock(minIndent) {
+    const obj = {};
+    while (i < rawLines.length) {
+      const line = rawLines[i];
+      const ind = indentOf(line);
+      if (ind < minIndent) break;
+      const trimmed = line.trim();
+      if (trimmed.startsWith("- ")) break;
+      const m = trimmed.match(/^([A-Za-z0-9_]+):\s*(.*)$/);
+      if (!m) { i++; continue; }
+      const key = m[1], rest = m[2];
+      i++;
+      if (rest !== "") {
+        obj[key] = parseValue(rest);
+      } else if (i < rawLines.length && indentOf(rawLines[i]) > ind && rawLines[i].trim().startsWith("- ")) {
+        obj[key] = parseList(ind + 1);
+      } else if (i < rawLines.length && indentOf(rawLines[i]) > ind) {
+        obj[key] = parseBlock(indentOf(rawLines[i]));
+      } else {
+        obj[key] = null;
+      }
+    }
+    return obj;
+  }
+  function parseList(minIndent) {
+    const arr = [];
+    while (i < rawLines.length) {
+      const line = rawLines[i];
+      const ind = indentOf(line);
+      if (ind < minIndent) break;
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("- ")) break;
+      const itemIndent = ind;
+      const first = trimmed.slice(2);
+      i++;
+      const itemObj = {};
+      const m = first.match(/^([A-Za-z0-9_]+):\s*(.*)$/);
+      if (m) itemObj[m[1]] = parseValue(m[2]);
+      while (i < rawLines.length && indentOf(rawLines[i]) > itemIndent) {
+        const m2 = rawLines[i].trim().match(/^([A-Za-z0-9_]+):\s*(.*)$/);
+        if (m2) itemObj[m2[1]] = parseValue(m2[2]);
+        i++;
+      }
+      arr.push(itemObj);
+    }
+    return arr;
+  }
+  return parseBlock(0);
+}
+
+function buildChartJsConfig(cfg) {
+  const type = cfg.type || "line";
+  const isCircular = type === "pie" || type === "doughnut" || type === "polarArea";
+  const series = cfg.series || [];
+  const datasets = series.map((s) => ({
+    label: s.title || s.label || "",
+    data: s.data || [],
+    backgroundColor: s.backgroundColor,
+    borderColor: s.borderColor,
+    borderWidth: s.borderWidth !== undefined ? s.borderWidth : 2,
+    fill: !!s.fill,
+    tension: s.tension !== undefined ? s.tension : 0.3,
+  }));
+  return {
+    type,
+    data: { labels: cfg.labels || [], datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: cfg.legend !== false } },
+      scales: isCircular ? {} : {
+        y: { beginAtZero: !!cfg.beginAtZero, stacked: !!cfg.stacked },
+        x: { stacked: !!cfg.stacked },
+      },
+    },
+  };
+}
+
+/* ---------------------------------------------------------------------
+   3) App: auth con Google, Picker, arbol del vault, pestanas, editor.
+--------------------------------------------------------------------- */
+
+const CLIENT_ID = "283181206190-vrs3hu3np6slfumuis78kp9akcle011v.apps.googleusercontent.com";
+const PICKER_API_KEY = "AIzaSyCjDY_u3JAEbojhObWjpoTJUDkMF4B089M";
+const ALLOWED_EMAIL = "aimar.aramburu12@gmail.com";
+const SCOPES = "https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email";
+const DRIVE_API = "https://www.googleapis.com/drive/v3";
+const FOLDER_MIME = "application/vnd.google-apps.folder";
+const STORAGE_FOLDER_KEY = "ovd_folder";
+
+let accessToken = null;
+let tokenClient = null;
+let pickerLoaded = false;
+let currentUserEmail = null;
+
+let rootFolder = null;
+let filesByPath = new Map();
+let nameIndex = new Map();
+let treeChildren = new Map();
+let collapsedFolders = new Set();
+
+let tabs = [];        // {path,id,content,dirty,viewMode}
+let activeTab = -1;
+let chartInstances = [];
+
+const $ = (id) => document.getElementById(id);
+const main = $("main");
+const tabbarEl = $("tabbar");
+const topbarActions = $("topbarActions");
+const treeEl = $("tree");
+const vaultNameEl = $("vaultName");
+const sidebar = $("sidebar");
+const scrim = $("scrim");
+const toastHost = $("toastHost");
+
+function toast(msg, isError) {
+  const node = document.createElement("div");
+  node.className = "toast" + (isError ? " error" : "");
+  node.textContent = msg;
+  toastHost.appendChild(node);
+  setTimeout(() => node.remove(), 4000);
+}
+
+function el(tag, opts) {
+  const node = document.createElement(tag);
+  if (opts) {
+    if (opts.text !== undefined) node.textContent = opts.text;
+    if (opts.class) node.className = opts.class;
+    if (opts.title) node.title = opts.title;
+    if (opts.onclick) node.addEventListener("click", opts.onclick);
+  }
+  return node;
+}
+
+function openSidebar() { sidebar.classList.add("open"); scrim.classList.add("show"); }
+function closeSidebar() { sidebar.classList.remove("open"); scrim.classList.remove("show"); }
+$("sidebarOpenBtn").addEventListener("click", openSidebar);
+$("sidebarCloseBtn").addEventListener("click", closeSidebar);
+scrim.addEventListener("click", closeSidebar);
+
+function showLoading(msg) {
+  main.innerHTML = "";
+  const wrap = el("div", { class: "center-screen" });
+  wrap.appendChild(el("div", { class: "spinner" }));
+  wrap.appendChild(el("p", { text: msg || "Cargando..." }));
+  main.appendChild(wrap);
+  topbarActions.innerHTML = "";
+  tabbarEl.innerHTML = "";
+}
+
+function showLogin(errorMsg) {
+  accessToken = null;
+  currentUserEmail = null;
+  sidebar.classList.remove("open");
+  scrim.classList.remove("show");
+  treeEl.innerHTML = "";
+  vaultNameEl.textContent = "Vault";
+  main.innerHTML = "";
+  topbarActions.innerHTML = "";
+  tabbarEl.innerHTML = "";
+  tabs = [];
+  activeTab = -1;
+  const wrap = el("div", { class: "center-screen" });
+  wrap.appendChild(el("h2", { text: "Acceso a tu vault" }));
+  wrap.appendChild(el("p", { text: "Solo la cuenta autorizada de Google puede entrar. El inicio de sesion es gestionado por Google; esta pagina nunca ve tu contrasena." }));
+  if (errorMsg) {
+    const err = el("p", { text: errorMsg });
+    err.style.color = "var(--danger)";
+    wrap.appendChild(err);
+  }
+  wrap.appendChild(el("button", { class: "pill primary", text: "Iniciar sesion con Google", onclick: requestLogin }));
+  main.appendChild(wrap);
+}
+
+function showFolderPicker() {
+  main.innerHTML = "";
+  topbarActions.innerHTML = "";
+  tabbarEl.innerHTML = "";
+  vaultNameEl.textContent = currentUserEmail || "Vault";
+  treeEl.innerHTML = "";
+  const wrap = el("div", { class: "center-screen" });
+  wrap.appendChild(el("h2", { text: "Elige la carpeta de tu vault" }));
+  wrap.appendChild(el("p", { text: 'Selecciona en Google Drive la carpeta que usa Obsidian para sincronizar (ej. "Obsidian Vault - Trading").' }));
+  wrap.appendChild(el("button", { class: "pill primary", text: "Elegir carpeta en Drive", onclick: openPicker }));
+  main.appendChild(wrap);
+}
+
+function initGoogle() {
+  tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: CLIENT_ID,
+    scope: SCOPES,
+    callback: onTokenResponse,
+    error_callback: (err) => {
+      console.error(err);
+      showLogin("No se pudo iniciar sesion (" + (err && err.type ? err.type : "error") + ").");
+    },
+  });
+  showLogin();
+}
+
+function requestLogin() {
+  tokenClient.requestAccessToken({ prompt: "" });
+  showLoading("Conectando con Google...");
+}
+
+async function onTokenResponse(resp) {
+  if (!resp || resp.error) { showLogin("Inicio de sesion cancelado o denegado."); return; }
+  accessToken = resp.access_token;
+  showLoading("Verificando cuenta...");
+  try {
+    const res = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", { headers: { Authorization: "Bearer " + accessToken } });
+    if (!res.ok) throw new Error("no se pudo verificar la cuenta");
+    const info = await res.json();
+    if (!info.email || info.email.toLowerCase() !== ALLOWED_EMAIL.toLowerCase()) {
+      revokeToken();
+      showLogin("Esta cuenta (" + (info.email || "desconocida") + ") no tiene acceso a este vault.");
+      return;
+    }
+    currentUserEmail = info.email;
+  } catch (e) {
+    revokeToken();
+    showLogin("No se pudo verificar tu cuenta de Google. Intentalo de nuevo.");
+    return;
+  }
+
+  const saved = safeParse(localStorage.getItem(STORAGE_FOLDER_KEY));
+  if (saved && saved.id && saved.name) { rootFolder = saved; loadVault(); }
+  else showFolderPicker();
+}
+
+function revokeToken() {
+  if (accessToken && window.google && google.accounts && google.accounts.oauth2) {
+    try { google.accounts.oauth2.revoke(accessToken, () => {}); } catch (e) {}
+  }
+  accessToken = null;
+}
+
+function logout() { revokeToken(); currentUserEmail = null; showLogin(); }
+function safeParse(s) { try { return JSON.parse(s); } catch (e) { return null; } }
+
+function ensurePickerLoaded() {
+  return new Promise((resolve, reject) => {
+    if (pickerLoaded) return resolve();
+    if (!window.gapi) return reject(new Error("Google API no disponible todavia, intenta de nuevo en unos segundos."));
+    gapi.load("picker", { callback: () => { pickerLoaded = true; resolve(); }, onerror: () => reject(new Error("no se pudo cargar el selector de Drive")) });
+  });
+}
+
+async function openPicker() {
+  try { await ensurePickerLoaded(); } catch (e) { toast(e.message, true); return; }
+  const view = new google.picker.DocsView(google.picker.ViewId.FOLDERS)
+    .setSelectFolderEnabled(true).setIncludeFolders(true).setMimeTypes(FOLDER_MIME);
+  const picker = new google.picker.PickerBuilder()
+    .setOAuthToken(accessToken).setDeveloperKey(PICKER_API_KEY).addView(view)
+    .setTitle("Elige la carpeta de tu vault")
+    .setCallback((data) => {
+      if (data.action === google.picker.Action.PICKED) {
+        const doc = data.docs[0];
+        rootFolder = { id: doc.id, name: doc.name };
+        localStorage.setItem(STORAGE_FOLDER_KEY, JSON.stringify(rootFolder));
+        loadVault();
+      }
+    }).build();
+  picker.setVisible(true);
+}
+
+function changeFolder() {
+  localStorage.removeItem(STORAGE_FOLDER_KEY);
+  rootFolder = null; tabs = []; activeTab = -1;
+  showFolderPicker();
+}
+$("changeFolderBtn").addEventListener("click", changeFolder);
+
+async function driveFetch(url, opts) {
+  opts = opts || {};
+  const res = await fetch(url, { ...opts, headers: { Authorization: "Bearer " + accessToken, ...(opts.headers || {}) } });
+  if (res.status === 401) { revokeToken(); showLogin("Tu sesion caduco, inicia sesion de nuevo."); throw new Error("sesion caducada"); }
+  if (!res.ok) { const text = await res.text().catch(() => ""); throw new Error("Drive API " + res.status + (text ? ": " + text.slice(0, 200) : "")); }
+  return res;
+}
+
+async function listChildrenOf(folderId) {
+  const out = [];
+  let pageToken;
+  do {
+    const q = encodeURIComponent(`'${folderId}' in parents and trashed=false`);
+    const params = `q=${q}&fields=nextPageToken,files(id,name,mimeType,modifiedTime)&pageSize=1000` + (pageToken ? `&pageToken=${pageToken}` : "");
+    const res = await driveFetch(`${DRIVE_API}/files?${params}`);
+    const data = await res.json();
+    out.push(...(data.files || []));
+    pageToken = data.nextPageToken;
+  } while (pageToken);
+  return out;
+}
+
+async function downloadText(fileId) { const res = await driveFetch(`${DRIVE_API}/files/${encodeURIComponent(fileId)}?alt=media`); return res.text(); }
+async function downloadBlob(fileId) { const res = await driveFetch(`${DRIVE_API}/files/${encodeURIComponent(fileId)}?alt=media`); return res.blob(); }
+async function uploadText(fileId, text) {
+  await driveFetch(`https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(fileId)}?uploadType=media`, {
+    method: "PATCH", headers: { "Content-Type": "text/plain; charset=utf-8" }, body: text,
+  });
+}
+
+async function loadVault() {
+  showLoading("Leyendo tu vault...");
+  filesByPath = new Map(); nameIndex = new Map(); treeChildren = new Map();
+  treeChildren.set("", []);
+  try {
+    const queue = [{ id: rootFolder.id, path: "" }];
+    while (queue.length) {
+      const { id, path } = queue.shift();
+      const children = await listChildrenOf(id);
+      children.sort((a, b) => {
+        const af = a.mimeType === FOLDER_MIME ? 0 : 1, bf = b.mimeType === FOLDER_MIME ? 0 : 1;
+        if (af !== bf) return af - bf;
+        return a.name.localeCompare(b.name, "es");
+      });
+      for (const child of children) {
+        const childPath = path ? path + "/" + child.name : child.name;
+        const isFolder = child.mimeType === FOLDER_MIME;
+        filesByPath.set(childPath, { id: child.id, name: child.name, mimeType: child.mimeType, modifiedTime: child.modifiedTime, path: childPath, parentPath: path, isFolder });
+        treeChildren.get(path).push(childPath);
+        if (isFolder) { treeChildren.set(childPath, []); queue.push({ id: child.id, path: childPath }); }
+        else {
+          const base = child.name.replace(/\.[^.]+$/, "").toLowerCase();
+          if (!nameIndex.has(base)) nameIndex.set(base, childPath);
+        }
+      }
+    }
+  } catch (e) {
+    main.innerHTML = "";
+    main.appendChild(el("div", { class: "empty", text: "Error leyendo el vault: " + e.message }));
+    return;
+  }
+
+  vaultNameEl.textContent = rootFolder.name;
+  $("sidebarEmail").textContent = currentUserEmail || "";
+  renderTree();
+  tabs = []; activeTab = -1;
+  renderTabBar();
+  main.innerHTML = "";
+  topbarActions.innerHTML = "";
+  const wrap = el("div", { class: "center-screen" });
+  wrap.appendChild(el("p", { text: "Selecciona una nota del menu para empezar." }));
+  main.appendChild(wrap);
+}
+
+function renderTree() {
+  treeEl.innerHTML = "";
+  for (const path of treeChildren.get("") || []) treeEl.appendChild(buildTreeNode(path));
+}
+
+function buildTreeNode(path) {
+  const file = filesByPath.get(path);
+  const item = el("div", { class: "tree-item" });
+  const row = el("div", { class: "tree-row" });
+
+  if (file.isFolder) {
+    const collapsed = collapsedFolders.has(path);
+    row.classList.toggle("collapsed", collapsed);
+    row.appendChild(el("span", { class: "chev", text: "▾" }));
+    row.appendChild(el("span", { class: "name", text: "📁 " + file.name }));
+    const childrenWrap = el("div", { class: "tree-children" + (collapsed ? " hidden" : "") });
+    for (const childPath of treeChildren.get(path) || []) childrenWrap.appendChild(buildTreeNode(childPath));
+    row.addEventListener("click", () => {
+      const nowCollapsed = childrenWrap.classList.toggle("hidden");
+      row.classList.toggle("collapsed", nowCollapsed);
+      if (nowCollapsed) collapsedFolders.add(path); else collapsedFolders.delete(path);
+    });
+    item.appendChild(row); item.appendChild(childrenWrap);
+  } else {
+    const isMd = file.name.toLowerCase().endsWith(".md");
+    const icon = isMd ? "📄" : /\.(png|jpe?g|gif|webp|svg)$/i.test(file.name) ? "🖼️" : "📎";
+    row.appendChild(el("span", { class: "chev", text: "" }));
+    row.appendChild(el("span", { class: "name", text: icon + " " + file.name.replace(/\.md$/i, "") }));
+    row.addEventListener("click", () => { closeSidebar(); if (isMd) openNote(path); else openOther(path); });
+    item.appendChild(row);
+  }
+  return item;
+}
+
+/* ---------------- Pestanas (tabs) ---------------- */
+
+function renderTabBar() {
+  tabbarEl.innerHTML = "";
+  tabs.forEach((tab, idx) => {
+    const file = filesByPath.get(tab.path);
+    const pill = el("div", { class: "tab" + (idx === activeTab ? " active" : "") + (tab.dirty ? " dirty" : "") });
+    const name = el("span", { class: "tab-name", text: file ? file.name.replace(/\.md$/i, "") : tab.path });
+    const close = el("span", { class: "tab-close", text: "✕" });
+    pill.appendChild(name);
+    pill.appendChild(close);
+    pill.addEventListener("click", (ev) => { if (ev.target === close) return; setActiveTab(idx); });
+    close.addEventListener("click", (ev) => { ev.stopPropagation(); closeTab(idx); });
+    tabbarEl.appendChild(pill);
+  });
+}
+
+function setActiveTab(idx) { activeTab = idx; renderTabBar(); renderNote(); }
+
+function closeTab(idx) {
+  tabs.splice(idx, 1);
+  if (tabs.length === 0) { activeTab = -1; }
+  else if (activeTab > idx) { activeTab--; }
+  else if (activeTab === idx) { activeTab = Math.min(idx, tabs.length - 1); }
+  renderTabBar();
+  if (activeTab === -1) {
+    topbarActions.innerHTML = "";
+    const wrap = el("div", { class: "center-screen" });
+    wrap.appendChild(el("p", { text: "Selecciona una nota del menu para empezar." }));
+    main.innerHTML = ""; main.appendChild(wrap);
+  } else {
+    renderNote();
+  }
+}
+
+/* ---------------- Abrir notas / archivos ---------------- */
+
+async function openNote(path) {
+  const existingIdx = tabs.findIndex((t) => t.path === path);
+  if (existingIdx !== -1) { setActiveTab(existingIdx); return; }
+  const file = filesByPath.get(path);
+  if (!file) { toast("Nota no encontrada: " + path, true); return; }
+  showLoading("Abriendo " + file.name + "...");
+  try {
+    const content = await downloadText(file.id);
+    tabs.push({ path, id: file.id, content, dirty: false, viewMode: "preview" });
+    activeTab = tabs.length - 1;
+    renderTabBar();
+    renderNote();
+  } catch (e) {
+    main.innerHTML = "";
+    main.appendChild(el("div", { class: "empty", text: "Error abriendo la nota: " + e.message }));
+  }
+}
+
+async function openOther(path) {
+  const file = filesByPath.get(path);
+  const isImg = /\.(png|jpe?g|gif|webp|svg)$/i.test(file.name);
+  topbarActions.innerHTML = "";
+  if (isImg) {
+    showLoading("Cargando imagen...");
+    try {
+      const blob = await downloadBlob(file.id);
+      const url = URL.createObjectURL(blob);
+      main.innerHTML = "";
+      const wrap = el("div", { class: "center-screen" });
+      const img = document.createElement("img");
+      img.src = url; img.style.maxWidth = "100%"; img.style.borderRadius = "8px";
+      wrap.appendChild(img);
+      main.appendChild(wrap);
+    } catch (e) {
+      main.innerHTML = "";
+      main.appendChild(el("div", { class: "empty", text: "Error cargando la imagen: " + e.message }));
+    }
+  } else {
+    main.innerHTML = "";
+    const wrap = el("div", { class: "center-screen" });
+    wrap.appendChild(el("p", { text: "Este tipo de archivo no se puede previsualizar aqui." }));
+    const link = el("a", { text: "Abrir en Google Drive" });
+    link.href = `https://drive.google.com/file/d/${encodeURIComponent(file.id)}/view`;
+    link.target = "_blank"; link.rel = "noopener noreferrer";
+    wrap.appendChild(link);
+    main.appendChild(wrap);
+  }
+}
+
+/* ---------------- Render de la nota activa ---------------- */
+
+function destroyCharts() {
+  for (const c of chartInstances) { try { c.destroy(); } catch (e) {} }
+  chartInstances = [];
+}
+
+function renderNote() {
+  destroyCharts();
+  if (activeTab === -1 || !tabs[activeTab]) return;
+  const tab = tabs[activeTab];
+  const file = filesByPath.get(tab.path);
+
+  topbarActions.innerHTML = "";
+  if (tab.viewMode === "preview") {
+    topbarActions.appendChild(el("button", { class: "icon-btn", title: "Editar", text: "✏️", onclick: () => { tab.viewMode = "edit"; renderNote(); } }));
+  } else {
+    topbarActions.appendChild(el("button", { class: "icon-btn", title: "Vista previa", text: "👁️", onclick: () => { tab.viewMode = "preview"; renderNote(); } }));
+    const saveBtn = el("button", { class: "pill primary", text: "Guardar", onclick: () => saveTab(tab, saveBtn) });
+    saveBtn.disabled = !tab.dirty;
+    topbarActions.appendChild(saveBtn);
+  }
+
+  main.innerHTML = "";
+  const wrap = el("div", { class: "note-wrap" });
+
+  if (tab.viewMode === "edit") {
+    const textarea = document.createElement("textarea");
+    textarea.value = tab.content;
+    textarea.addEventListener("input", () => {
+      tab.content = textarea.value; tab.dirty = true;
+      renderTabBar();
+      const saveBtn = topbarActions.querySelector("button.primary");
+      if (saveBtn) saveBtn.disabled = false;
+    });
+    wrap.appendChild(textarea);
+  } else {
+    const div = el("div", { class: "md" });
+    const pendingImages = [];
+    const pendingCharts = [];
+    let counter = 0;
+    const ctx = {
+      onWikilink: (target, alias) => renderWikilink(target, alias),
+      onEmbed: (target, alias) => renderEmbed(target, alias, pendingImages, () => counter++),
+      onImage: (url, alt) => renderInlineImage(url, alt, pendingImages, () => counter++, tab.path),
+      onChart: (yamlText) => renderChartPlaceholder(yamlText, pendingCharts, () => counter++),
+    };
+    div.innerHTML = renderMarkdown(tab.content, ctx);
+    wrap.appendChild(div);
+
+    div.addEventListener("click", (ev) => {
+      const a = ev.target.closest("a[data-open]");
+      if (a) { ev.preventDefault(); openNote(a.getAttribute("data-open")); }
+    });
+    div.addEventListener("change", (ev) => {
+      const cb = ev.target.closest('input[type="checkbox"][data-line]');
+      if (cb) toggleCheckboxLine(tab, Number(cb.getAttribute("data-line")), cb.checked);
+    });
+
+    resolvePendingImages(pendingImages);
+    resolvePendingCharts(pendingCharts);
+  }
+
+  main.appendChild(wrap);
+}
+
+function renderWikilink(target, alias) {
+  const path = nameIndex.get(target.toLowerCase());
+  const label = mdEscapeHtml(alias || target);
+  if (!path) return `<a href="#" class="wikilink broken" title="Nota no encontrada">${label}</a>`;
+  return `<a href="#" class="wikilink" data-open="${mdEscapeHtml(path)}">${label}</a>`;
+}
+
+function renderEmbed(target, alias, pendingImages, nextId) {
+  const path = nameIndex.get(target.toLowerCase()) || (filesByPath.has(target) ? target : null);
+  if (!path) return `<span class="embed-missing">[[${mdEscapeHtml(target)}]] no encontrada</span>`;
+  const file = filesByPath.get(path);
+  if (/\.(png|jpe?g|gif|webp|svg)$/i.test(file.name)) {
+    const holderId = "embed-img-" + nextId();
+    pendingImages.push({ holderId, fileId: file.id });
+    return `<span class="embed-missing" id="${holderId}">Cargando ${mdEscapeHtml(file.name)}...</span>`;
+  }
+  const label = mdEscapeHtml(alias || file.name.replace(/\.md$/i, ""));
+  return `<a href="#" class="wikilink" data-open="${mdEscapeHtml(path)}">🔗 ${label}</a>`;
+}
+
+function renderInlineImage(url, alt, pendingImages, nextId, currentPath) {
+  const decoded = decodeURIComponent(url);
+  let file = filesByPath.get(decoded);
+  if (!file) {
+    const baseDir = currentPath.includes("/") ? currentPath.slice(0, currentPath.lastIndexOf("/")) : "";
+    file = filesByPath.get(baseDir ? baseDir + "/" + decoded : decoded);
+  }
+  if (!file) {
+    const base = decoded.split("/").pop().replace(/\.[^.]+$/, "").toLowerCase();
+    const p = nameIndex.get(base);
+    if (p) file = filesByPath.get(p);
+  }
+  if (!file) return `<span class="embed-missing">imagen no encontrada: ${mdEscapeHtml(decoded)}</span>`;
+  const holderId = "embed-img-" + nextId();
+  pendingImages.push({ holderId, fileId: file.id, alt });
+  return `<span class="embed-missing" id="${holderId}">Cargando imagen...</span>`;
+}
+
+function renderChartPlaceholder(yamlText, pendingCharts, nextId) {
+  let cfg;
+  try { cfg = parseChartYaml(yamlText); } catch (e) { return `<div class="empty">Grafica invalida.</div>`; }
+  const holderId = "chart-" + nextId();
+  pendingCharts.push({ holderId, cfg });
+  return `<div class="chart-wrap"><canvas id="${holderId}"></canvas></div>`;
+}
+
+async function resolvePendingImages(pending) {
+  for (const p of pending) {
+    try {
+      const blob = await downloadBlob(p.fileId);
+      const url = URL.createObjectURL(blob);
+      const holder = document.getElementById(p.holderId);
+      if (!holder) continue;
+      const img = document.createElement("img");
+      img.src = url; img.alt = p.alt || "";
+      holder.replaceWith(img);
+    } catch (e) {
+      const holder = document.getElementById(p.holderId);
+      if (holder) holder.textContent = "No se pudo cargar la imagen.";
+    }
+  }
+}
+
+function resolvePendingCharts(pending) {
+  for (const p of pending) {
+    const canvas = document.getElementById(p.holderId);
+    if (!canvas || typeof Chart === "undefined") continue;
+    try {
+      const chartConfig = buildChartJsConfig(p.cfg);
+      chartInstances.push(new Chart(canvas.getContext("2d"), chartConfig));
+    } catch (e) {
+      console.error("chart error", e);
+    }
+  }
+}
+
+function toggleCheckboxLine(tab, lineIndex, checked) {
+  const lines = tab.content.split("\n");
+  if (lineIndex < 0 || lineIndex >= lines.length) return;
+  lines[lineIndex] = lines[lineIndex].replace(/\[( |x|X)\]/, checked ? "[x]" : "[ ]");
+  tab.content = lines.join("\n");
+  tab.dirty = true;
+  saveTab(tab, null);
+}
+
+async function saveTab(tab, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = "Guardando..."; }
+  try {
+    await uploadText(tab.id, tab.content);
+    tab.dirty = false;
+    renderTabBar();
+    toast("Guardado.");
+    if (activeTab !== -1 && tabs[activeTab] === tab) renderNote();
+  } catch (e) {
+    toast("Error al guardar: " + e.message, true);
+    if (btn) { btn.disabled = false; btn.textContent = "Guardar"; }
+  }
+}
+
+/* ---------------- Busqueda ---------------- */
+
+$("searchInput").addEventListener("input", (ev) => {
+  const q = ev.target.value.trim().toLowerCase();
+  if (!q) { renderTree(); return; }
+  treeEl.innerHTML = "";
+  const matches = [...filesByPath.values()].filter((f) => !f.isFolder && f.name.toLowerCase().includes(q)).sort((a, b) => a.name.localeCompare(b.name, "es"));
+  if (matches.length === 0) { treeEl.appendChild(el("div", { class: "empty", text: "Sin resultados." })); return; }
+  for (const f of matches) {
+    const row = el("div", { class: "tree-row" });
+    const icon = f.name.toLowerCase().endsWith(".md") ? "📄" : "📎";
+    row.appendChild(el("span", { class: "chev", text: "" }));
+    row.appendChild(el("span", { class: "name", text: icon + " " + f.path }));
+    row.addEventListener("click", () => {
+      closeSidebar(); ev.target.value = ""; renderTree();
+      if (f.name.toLowerCase().endsWith(".md")) openNote(f.path); else openOther(f.path);
+    });
+    treeEl.appendChild(row);
+  }
+});
+
+$("logoutBtn").addEventListener("click", logout);
+
+showLoading("Iniciando...");
+function waitForGoogle() {
+  if (window.google && google.accounts && google.accounts.oauth2) initGoogle();
+  else setTimeout(waitForGoogle, 100);
+}
+waitForGoogle();
+</script>
 </body>
 </html>
