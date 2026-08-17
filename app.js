@@ -244,8 +244,10 @@ function initGoogle() {
 }
 
 function requestLogin() {
-  showLoading("Conectando con Google...");
+  // El popup de Google debe abrirse de forma sincrona dentro del gesto de toque/click,
+  // sin nada de por medio (Safari/iOS es especialmente estricto con esto).
   tokenClient.requestAccessToken({ prompt: "" });
+  showLoading("Conectando con Google...");
 }
 
 async function onTokenResponse(resp) {
