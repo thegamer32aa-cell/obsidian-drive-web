@@ -22,6 +22,10 @@
   --accent:#7c6cf0; --accent-fg:#ffffff;
   --danger:#e5534b; --ok:#3fb950;
   --sidebar-w:280px; --topbar-h:52px;
+  /* alias de variables de tema de Obsidian, usadas por scripts dataviewjs portados del vault */
+  --color-text-primary:var(--fg); --color-text-secondary:var(--muted); --color-text-tertiary:var(--muted);
+  --color-background-secondary:var(--bg-secondary); --color-border-tertiary:var(--border);
+  --interactive-accent:var(--accent);
 }
 *{box-sizing:border-box;}
 html,body{margin:0;padding:0;height:100%;background:var(--bg);color:var(--fg);
@@ -126,6 +130,7 @@ button.pill:disabled{opacity:.5;}
 .md .embed-missing{color:var(--muted);font-style:italic;font-size:.85em;}
 .chart-wrap{background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;
   padding:14px;margin:1em 0;position:relative;height:320px;}
+.djs-wrap{margin:1em 0;}
 
 .toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--bg-elevated);
   border:1px solid var(--border);color:var(--fg);padding:10px 16px;border-radius:8px;font-size:.85rem;
@@ -261,8 +266,11 @@ function renderMarkdown(source, ctx) {
         i++;
       }
       i++;
-      if (lang.toLowerCase() === "chart") {
+      const langLower = lang.toLowerCase();
+      if (langLower === "chart") {
         html.push(ctx.onChart(codeLines.join("\n")));
+      } else if (langLower === "dataviewjs") {
+        html.push(ctx.onDataviewJs(codeLines.join("\n")));
       } else {
         html.push(`<pre><code${lang ? ` data-lang="${mdEscapeHtml(lang)}"` : ""}>${mdEscapeHtml(codeLines.join("\n"))}</code></pre>`);
       }
@@ -464,6 +472,215 @@ function buildChartJsConfig(cfg) {
 }
 
 /* ---------------------------------------------------------------------
+   2b) Frontmatter (propiedades --- ... ---) y un "shim" minimo de la API
+   de Obsidian (dv.*, app.vault/*, app.metadataCache, app.fileManager,
+   app.workspace) para poder ejecutar, tal cual, los bloques ```dataviewjs
+   que ya tienes en el vault (checklists, puntuacion, etc.) contra Drive
+   en vez de contra el Obsidian de escritorio. Es un compatible parcial,
+   pensado para los patrones que usan tus propias notas, no un Dataview
+   completo.
+--------------------------------------------------------------------- */
+
+function parseFrontmatterBlock(content) {
+  const m = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
+  if (!m) return { fm: {}, body: content };
+  const fm = {};
+  for (const line of m[1].split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const mm = line.match(/^([A-Za-z0-9_\-]+):\s*(.*)$/);
+    if (mm) fm[mm[1]] = parseFmValue(mm[2]);
+  }
+  return { fm, body: content.slice(m[0].length) };
+}
+function parseFmScalar(s) {
+  s = s.trim();
+  if (s === "true") return true;
+  if (s === "false") return false;
+  if (/^-?\d+(\.\d+)?$/.test(s)) return Number(s);
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) return s.slice(1, -1);
+  return s;
+}
+function parseFmValue(s) {
+  s = s.trim();
+  if (s === "") return null;
+  if (s.startsWith("[") && s.endsWith("]")) return s.slice(1, -1).split(",").map((x) => x.trim()).filter((x) => x !== "").map(parseFmScalar);
+  return parseFmScalar(s);
+}
+function serializeFmScalar(v) {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "boolean" || typeof v === "number") return String(v);
+  const s = String(v);
+  if (s !== "" && /^[A-Za-z0-9_.\-\/ áéíóúñÁÉÍÓÚÑ]*$/.test(s)) return s;
+  return JSON.stringify(s);
+}
+function serializeFrontmatter(fm) {
+  const lines = Object.keys(fm).map((k) => {
+    const v = fm[k];
+    return `${k}: ${Array.isArray(v) ? "[" + v.map(serializeFmScalar).join(", ") + "]" : serializeFmScalar(v)}`;
+  });
+  return "---\n" + lines.join("\n") + "\n---\n";
+}
+
+async function ensureDriveFolderPath(relFolder) {
+  if (!relFolder) return rootFolder.id;
+  const existing = filesByPath.get(relFolder);
+  if (existing && existing.isFolder) return existing.id;
+  const parts = relFolder.split("/");
+  let parentId = rootFolder.id, acc = "";
+  for (const part of parts) {
+    acc = acc ? acc + "/" + part : part;
+    const ex = filesByPath.get(acc);
+    if (ex && ex.isFolder) { parentId = ex.id; continue; }
+    const created = await driveFetch(`${DRIVE_API}/files?fields=id`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: part, mimeType: FOLDER_MIME, parents: [parentId] }),
+    }).then((r) => r.json());
+    const parentPath = acc.includes("/") ? acc.slice(0, acc.lastIndexOf("/")) : "";
+    filesByPath.set(acc, { id: created.id, name: part, mimeType: FOLDER_MIME, path: acc, parentPath, isFolder: true });
+    if (!treeChildren.has(acc)) treeChildren.set(acc, []);
+    if (!treeChildren.get(parentPath)) treeChildren.set(parentPath, []);
+    if (!treeChildren.get(parentPath).includes(acc)) treeChildren.get(parentPath).push(acc);
+    parentId = created.id;
+  }
+  return parentId;
+}
+
+async function prefetchForScript(code) {
+  const folders = new Set();
+  const re = /"([^"]*\/[^"]*)"/g;
+  let m;
+  while ((m = re.exec(code))) folders.add(m[1]);
+  const paths = new Set();
+  for (const folder of folders) {
+    for (const f of filesByPath.values()) {
+      if (f.isFolder || !f.path.toLowerCase().endsWith(".md")) continue;
+      if (f.path === folder || f.path.startsWith(folder + "/")) paths.add(f.path);
+    }
+  }
+  await Promise.all([...paths].map(async (p) => {
+    if (contentCache.has(p)) return;
+    const file = filesByPath.get(p);
+    try {
+      const content = await downloadText(file.id);
+      contentCache.set(p, content);
+      frontmatterCache.set(p, parseFrontmatterBlock(content).fm);
+    } catch (e) { /* si un archivo falla, seguimos con el resto */ }
+  }));
+}
+
+function makeDvArray(arr) {
+  arr.where = (fn) => makeDvArray(arr.filter(fn));
+  arr.array = () => arr.slice();
+  return arr;
+}
+
+function makeDvShim(holder) {
+  return {
+    el(tag, text, opts) {
+      const e = document.createElement(tag);
+      if (text) e.textContent = text;
+      if (opts && opts.cls) e.className = opts.cls;
+      holder.appendChild(e);
+      return e;
+    },
+    pages(source) {
+      let folder = String(source || "").trim();
+      const qm = folder.match(/^"(.*)"$/);
+      if (qm) folder = qm[1];
+      const arr = [];
+      for (const f of filesByPath.values()) {
+        if (f.isFolder || !f.path.toLowerCase().endsWith(".md")) continue;
+        if (f.path !== folder && !f.path.startsWith(folder + "/")) continue;
+        const fm = frontmatterCache.get(f.path) || {};
+        arr.push(Object.assign({}, fm, { file: { name: f.name.replace(/\.md$/i, ""), path: f.path } }));
+      }
+      return makeDvArray(arr);
+    },
+  };
+}
+
+function makeAppShim() {
+  return {
+    vault: {
+      getAbstractFileByPath(path) {
+        const f = filesByPath.get(path);
+        return f ? { path: f.path, name: f.name, id: f.id } : null;
+      },
+      async create(path, content) {
+        const relFolder = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+        const folderId = await ensureDriveFolderPath(relFolder);
+        const name = path.slice(path.lastIndexOf("/") + 1);
+        const created = await driveFetch(`${DRIVE_API}/files?fields=id`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, parents: [folderId] }),
+        }).then((r) => r.json());
+        await uploadText(created.id, content);
+        const fileRec = { id: created.id, name, mimeType: "text/markdown", modifiedTime: new Date().toISOString(), path, parentPath: relFolder, isFolder: false };
+        filesByPath.set(path, fileRec);
+        if (!treeChildren.has(relFolder)) treeChildren.set(relFolder, []);
+        treeChildren.get(relFolder).push(path);
+        const base = name.replace(/\.[^.]+$/, "").toLowerCase();
+        if (!nameIndex.has(base)) nameIndex.set(base, path);
+        contentCache.set(path, content);
+        frontmatterCache.set(path, parseFrontmatterBlock(content).fm);
+        renderTree();
+        return fileRec;
+      },
+      async read(file) {
+        if (contentCache.has(file.path)) return contentCache.get(file.path);
+        const c = await downloadText(file.id);
+        contentCache.set(file.path, c);
+        return c;
+      },
+      async modify(file, content) {
+        await uploadText(file.id, content);
+        contentCache.set(file.path, content);
+      },
+    },
+    metadataCache: {
+      getFileCache(file) { return { frontmatter: frontmatterCache.get(file.path) || {} }; },
+    },
+    fileManager: {
+      async processFrontMatter(file, fn) {
+        let content = contentCache.get(file.path);
+        if (content === undefined) { content = await downloadText(file.id); contentCache.set(file.path, content); }
+        const parsed = parseFrontmatterBlock(content);
+        fn(parsed.fm);
+        const newContent = serializeFrontmatter(parsed.fm) + parsed.body;
+        await uploadText(file.id, newContent);
+        contentCache.set(file.path, newContent);
+        frontmatterCache.set(file.path, parsed.fm);
+      },
+    },
+    workspace: {
+      openLinkText(linkText) {
+        const target = String(linkText).split("|")[0].split("#")[0].trim();
+        let path = nameIndex.get(target.toLowerCase());
+        if (!path && filesByPath.has(target)) path = target;
+        if (!path) { toast("No se encontro: " + linkText, true); return; }
+        closeSidebar();
+        if (path.toLowerCase().endsWith(".md")) openNote(path); else openOther(path);
+      },
+    },
+  };
+}
+
+async function runDataviewJs(code, holderId) {
+  const holder = document.getElementById(holderId);
+  if (!holder) return;
+  try {
+    await prefetchForScript(code);
+    const dvShim = makeDvShim(holder);
+    const appShim = makeAppShim();
+    const fn = new Function("dv", "app", "return (async () => {\n" + code + "\n})()");
+    await fn(dvShim, appShim);
+  } catch (e) {
+    console.error("dataviewjs error", e);
+    holder.innerHTML = "";
+    holder.appendChild(el("div", { class: "empty", text: "No se pudo ejecutar este bloque interactivo: " + e.message }));
+  }
+}
+
+/* ---------------------------------------------------------------------
    3) App: auth con Google, Picker, arbol del vault, pestanas, editor.
 --------------------------------------------------------------------- */
 
@@ -489,6 +706,8 @@ let collapsedFolders = new Set();
 let tabs = [];        // {path,id,content,dirty,viewMode}
 let activeTab = -1;
 let chartInstances = [];
+let contentCache = new Map();      // path -> texto crudo (cache para dataviewjs)
+let frontmatterCache = new Map();  // path -> objeto frontmatter parseado
 
 const $ = (id) => document.getElementById(id);
 const main = $("main");
@@ -892,12 +1111,14 @@ function renderNote() {
     const div = el("div", { class: "md" });
     const pendingImages = [];
     const pendingCharts = [];
+    const pendingScripts = [];
     let counter = 0;
     const ctx = {
       onWikilink: (target, alias) => renderWikilink(target, alias),
       onEmbed: (target, alias) => renderEmbed(target, alias, pendingImages, () => counter++),
       onImage: (url, alt) => renderInlineImage(url, alt, pendingImages, () => counter++, tab.path),
       onChart: (yamlText) => renderChartPlaceholder(yamlText, pendingCharts, () => counter++),
+      onDataviewJs: (code) => renderDataviewJsPlaceholder(code, pendingScripts, () => counter++),
     };
     div.innerHTML = renderMarkdown(tab.content, ctx);
     wrap.appendChild(div);
@@ -913,6 +1134,7 @@ function renderNote() {
 
     resolvePendingImages(pendingImages);
     resolvePendingCharts(pendingCharts);
+    for (const p of pendingScripts) runDataviewJs(p.code, p.holderId);
   }
 
   main.appendChild(wrap);
@@ -962,6 +1184,12 @@ function renderChartPlaceholder(yamlText, pendingCharts, nextId) {
   const holderId = "chart-" + nextId();
   pendingCharts.push({ holderId, cfg });
   return `<div class="chart-wrap"><canvas id="${holderId}"></canvas></div>`;
+}
+
+function renderDataviewJsPlaceholder(code, pendingScripts, nextId) {
+  const holderId = "djs-" + nextId();
+  pendingScripts.push({ holderId, code });
+  return `<div class="djs-wrap" id="${holderId}"><div class="center-screen" style="height:80px;"><div class="spinner"></div></div></div>`;
 }
 
 async function resolvePendingImages(pending) {
