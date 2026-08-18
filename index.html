@@ -6,7 +6,7 @@
 <meta name="referrer" content="strict-origin-when-cross-origin">
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'none';
-  script-src 'self' 'unsafe-inline' https://accounts.google.com https://apis.google.com;
+  script-src 'self' 'unsafe-inline' 'unsafe-eval' https://accounts.google.com https://apis.google.com;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   connect-src 'self' https://www.googleapis.com https://oauth2.googleapis.com https://accounts.google.com;
@@ -531,6 +531,15 @@ async function ensureDriveFolderPath(relFolder) {
     acc = acc ? acc + "/" + part : part;
     const ex = filesByPath.get(acc);
     if (ex && ex.isFolder) { parentId = ex.id; continue; }
+    // Puede que la carpeta ya exista en Drive pero no la tengamos cargada todavia (carga perezosa):
+    // la buscamos antes de crear una duplicada.
+    const found = (await driveSearchByName(part, true)).find((f) => f.mimeType === FOLDER_MIME && (f.parents || []).includes(parentId));
+    if (found) {
+      const parentPath = acc.includes("/") ? acc.slice(0, acc.lastIndexOf("/")) : "";
+      addFileToIndexes(acc, found, parentPath);
+      parentId = found.id;
+      continue;
+    }
     const created = await driveFetch(`${DRIVE_API}/files?fields=id`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: part, mimeType: FOLDER_MIME, parents: [parentId] }),
@@ -545,11 +554,38 @@ async function ensureDriveFolderPath(relFolder) {
   return parentId;
 }
 
+// Resuelve una carpeta por su ruta completa, subiendo desde la raiz y buscando cada
+// tramo con driveSearchByName si no esta ya cargado (evita tener que recorrer todo el vault).
+async function resolveFolderPath(folderPath) {
+  if (!folderPath || filesByPath.get(folderPath)) return filesByPath.get(folderPath) || null;
+  const parts = folderPath.split("/");
+  let parentId = rootFolder.id, acc = "";
+  for (const part of parts) {
+    acc = acc ? acc + "/" + part : part;
+    let rec = filesByPath.get(acc);
+    if (!rec) {
+      const matches = await driveSearchByName(part, true);
+      const found = matches.find((f) => f.mimeType === FOLDER_MIME && (f.parents || []).includes(parentId));
+      if (!found) return null;
+      const parentPath = acc.includes("/") ? acc.slice(0, acc.lastIndexOf("/")) : "";
+      rec = addFileToIndexes(acc, found, parentPath);
+    }
+    parentId = rec.id;
+  }
+  return filesByPath.get(folderPath);
+}
+
 async function prefetchForScript(code) {
   const folders = new Set();
   const re = /"([^"]*\/[^"]*)"/g;
   let m;
   while ((m = re.exec(code))) folders.add(m[1]);
+
+  for (const folder of folders) {
+    const rec = await resolveFolderPath(folder);
+    if (rec && rec.isFolder) await fetchFolderChildren(folder);
+  }
+
   const paths = new Set();
   for (const folder of folders) {
     for (const f of filesByPath.values()) {
@@ -666,15 +702,19 @@ function makeAppShim() {
   };
 }
 
+function timeoutAfter(ms, label) {
+  return new Promise((_, reject) => setTimeout(() => reject(new Error(label + " tardo demasiado (>" + Math.round(ms / 1000) + "s)")), ms));
+}
+
 async function runDataviewJs(code, holderId) {
   const holder = document.getElementById(holderId);
   if (!holder) return;
   try {
-    await prefetchForScript(code);
+    await Promise.race([prefetchForScript(code), timeoutAfter(20000, "La preparacion del bloque")]);
     const dvShim = makeDvShim(holder);
     const appShim = makeAppShim();
     const fn = new Function("dv", "app", "return (async () => {\n" + code + "\n})()");
-    await fn(dvShim, appShim);
+    await Promise.race([fn(dvShim, appShim), timeoutAfter(20000, "El bloque interactivo")]);
   } catch (e) {
     console.error("dataviewjs error", e);
     holder.innerHTML = "";
