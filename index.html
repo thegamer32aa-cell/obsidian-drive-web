@@ -703,7 +703,8 @@ let rootFolder = null;
 let filesByPath = new Map();
 let nameIndex = new Map();
 let treeChildren = new Map();
-let collapsedFolders = new Set();
+let expandedFolders = new Set(); // carpetas que el usuario ha abierto (empiezan cerradas)
+let loadedFolders = new Set();   // carpetas cuyos hijos ya se trajeron de Drive (o de cache) esta sesion
 
 let tabs = [];        // {path,id,content,dirty,viewMode}
 let activeTab = -1;
@@ -717,7 +718,7 @@ let frontmatterCache = new Map();  // path -> objeto frontmatter parseado
    instante desde esta cache, y Drive solo se consulta de fondo para
    traer cambios (no bloquea nada).
 --------------------------------------------------------------------- */
-const IDB_NAME = "ovd_cache_v1";
+const IDB_NAME = "ovd_cache_v2";
 let idbPromise = null;
 
 function idbOpen() {
@@ -729,6 +730,7 @@ function idbOpen() {
       const db = req.result;
       if (!db.objectStoreNames.contains("tree")) db.createObjectStore("tree");
       if (!db.objectStoreNames.contains("content")) db.createObjectStore("content");
+      if (!db.objectStoreNames.contains("loaded")) db.createObjectStore("loaded");
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => resolve(null);
@@ -771,9 +773,10 @@ async function idbClearAll() {
   const db = await idbOpen();
   if (!db) return;
   return new Promise((resolve) => {
-    const tx = db.transaction(["tree", "content"], "readwrite");
+    const tx = db.transaction(["tree", "content", "loaded"], "readwrite");
     tx.objectStore("tree").clear();
     tx.objectStore("content").clear();
+    tx.objectStore("loaded").clear();
     tx.oncomplete = () => resolve();
     tx.onerror = () => resolve();
   });
@@ -970,6 +973,69 @@ async function listChildrenOf(folderId) {
   return out;
 }
 
+function addFileToIndexes(childPath, child, parentPath) {
+  const isFolder = child.mimeType === FOLDER_MIME;
+  const rec = { id: child.id, name: child.name, mimeType: child.mimeType, modifiedTime: child.modifiedTime, path: childPath, parentPath, isFolder };
+  filesByPath.set(childPath, rec);
+  if (!treeChildren.has(parentPath)) treeChildren.set(parentPath, []);
+  if (!treeChildren.get(parentPath).includes(childPath)) treeChildren.get(parentPath).push(childPath);
+  if (isFolder && !treeChildren.has(childPath)) treeChildren.set(childPath, []);
+  if (!isFolder && childPath.toLowerCase().endsWith(".md")) {
+    const base = child.name.replace(/\.[^.]+$/, "").toLowerCase();
+    if (!nameIndex.has(base)) nameIndex.set(base, childPath);
+  }
+  idbSet("tree", childPath, rec);
+  return rec;
+}
+
+// Trae solo los hijos directos de una carpeta (carga perezosa: se llama al expandirla).
+async function fetchFolderChildren(path) {
+  if (loadedFolders.has(path)) return;
+  const folderId = path === "" ? rootFolder.id : filesByPath.get(path).id;
+  const children = await listChildrenOf(folderId);
+  children.sort((a, b) => {
+    const af = a.mimeType === FOLDER_MIME ? 0 : 1, bf = b.mimeType === FOLDER_MIME ? 0 : 1;
+    if (af !== bf) return af - bf;
+    return a.name.localeCompare(b.name, "es");
+  });
+  if (!treeChildren.has(path)) treeChildren.set(path, []);
+  for (const child of children) {
+    const childPath = path ? path + "/" + child.name : child.name;
+    addFileToIndexes(childPath, child, path);
+  }
+  loadedFolders.add(path);
+  idbSet("loaded", path, true);
+}
+
+// Busca un archivo por nombre directamente en Drive (sin recorrer carpeta por carpeta).
+// Funciona porque el Picker ya te dio acceso a toda la subcarpeta elegida, no solo a la carpeta en si.
+async function driveSearchByName(nameContains, exact) {
+  const safe = nameContains.replace(/'/g, "\\'");
+  const q = exact ? `name = '${safe}' and trashed=false` : `name contains '${safe}' and trashed=false`;
+  const params = `q=${encodeURIComponent(q)}&fields=files(id,name,mimeType,modifiedTime,parents)&pageSize=25`;
+  const res = await driveFetch(`${DRIVE_API}/files?${params}`);
+  const data = await res.json();
+  return data.files || [];
+}
+
+// Reconstruye la ruta completa (carpeta1/carpeta2/nombre.md) de un archivo encontrado por busqueda,
+// subiendo por sus carpetas padre hasta llegar a la raiz del vault.
+async function resolveFilePath(file) {
+  const segments = [file.name];
+  let parentId = (file.parents || [])[0];
+  let guard = 0;
+  while (parentId && parentId !== rootFolder.id && guard++ < 12) {
+    const res = await driveFetch(`${DRIVE_API}/files/${encodeURIComponent(parentId)}?fields=id,name,parents`);
+    const parent = await res.json();
+    segments.unshift(parent.name);
+    parentId = (parent.parents || [])[0];
+  }
+  const path = segments.join("/");
+  const parentPath = segments.slice(0, -1).join("/");
+  addFileToIndexes(path, file, parentPath);
+  return path;
+}
+
 async function downloadText(fileId) { const res = await driveFetch(`${DRIVE_API}/files/${encodeURIComponent(fileId)}?alt=media`); return res.text(); }
 async function downloadBlob(fileId) { const res = await driveFetch(`${DRIVE_API}/files/${encodeURIComponent(fileId)}?alt=media`); return res.blob(); }
 async function uploadText(fileId, text) {
@@ -978,121 +1044,54 @@ async function uploadText(fileId, text) {
   });
 }
 
-function walkVaultConcurrent(rootId, rootPath) {
-  const CONCURRENCY = 6;
-  const queue = [{ id: rootId, path: rootPath }];
-  let active = 0;
-
-  return new Promise((resolve, reject) => {
-    let failed = false;
-
-    function processFolder(item) {
-      active++;
-      listChildrenOf(item.id)
-        .then((children) => {
-          children.sort((a, b) => {
-            const af = a.mimeType === FOLDER_MIME ? 0 : 1, bf = b.mimeType === FOLDER_MIME ? 0 : 1;
-            if (af !== bf) return af - bf;
-            return a.name.localeCompare(b.name, "es");
-          });
-          for (const child of children) {
-            const childPath = item.path ? item.path + "/" + child.name : child.name;
-            const isFolder = child.mimeType === FOLDER_MIME;
-            filesByPath.set(childPath, { id: child.id, name: child.name, mimeType: child.mimeType, modifiedTime: child.modifiedTime, path: childPath, parentPath: item.path, isFolder });
-            treeChildren.get(item.path).push(childPath);
-            if (isFolder) {
-              treeChildren.set(childPath, []);
-              queue.push({ id: child.id, path: childPath });
-            } else {
-              const base = child.name.replace(/\.[^.]+$/, "").toLowerCase();
-              if (!nameIndex.has(base)) nameIndex.set(base, childPath);
-            }
-          }
-          active--;
-          pump();
-        })
-        .catch((e) => {
-          if (!failed) { failed = true; reject(e); }
-        });
-    }
-
-    function pump() {
-      if (failed) return;
-      while (active < CONCURRENCY && queue.length) processFolder(queue.shift());
-      if (!failed && active === 0 && queue.length === 0) resolve();
-    }
-
-    pump();
-  });
-}
-
-function rebuildIndexesFromFiles() {
-  nameIndex = new Map();
-  treeChildren = new Map();
-  treeChildren.set("", []);
-  for (const f of filesByPath.values()) {
-    if (!treeChildren.has(f.parentPath)) treeChildren.set(f.parentPath, []);
-    treeChildren.get(f.parentPath).push(f.path);
-    if (f.isFolder && !treeChildren.has(f.path)) treeChildren.set(f.path, []);
-    if (!f.isFolder && f.path.toLowerCase().endsWith(".md")) {
-      const base = f.name.replace(/\.[^.]+$/, "").toLowerCase();
-      if (!nameIndex.has(base)) nameIndex.set(base, f.path);
-    }
-  }
-  for (const [, children] of treeChildren) {
-    children.sort((a, b) => {
-      const fa = filesByPath.get(a), fb = filesByPath.get(b);
-      const af = fa.isFolder ? 0 : 1, bf = fb.isFolder ? 0 : 1;
-      if (af !== bf) return af - bf;
-      return fa.name.localeCompare(fb.name, "es");
-    });
-  }
-}
-
 async function loadVault() {
-  const cachedEntries = await idbGetAll("tree");
+  const [cachedEntries, cachedLoaded] = await Promise.all([idbGetAll("tree"), idbGetAll("loaded")]);
   const showedCached = cachedEntries.length > 0;
 
+  filesByPath = new Map(); treeChildren = new Map(); treeChildren.set("", []); nameIndex = new Map();
+  loadedFolders = new Set();
+
   if (showedCached) {
-    filesByPath = new Map(cachedEntries);
-    rebuildIndexesFromFiles();
-    vaultNameEl.textContent = rootFolder.name;
-    $("sidebarEmail").textContent = currentUserEmail || "";
-    renderTree();
-    tabs = []; activeTab = -1;
-    renderTabBar();
-    main.innerHTML = "";
-    topbarActions.innerHTML = "";
-    const wrap = el("div", { class: "center-screen" });
-    wrap.appendChild(el("p", { text: "Selecciona una nota del menu para empezar." }));
-    wrap.appendChild(el("p", { text: "Actualizando desde Drive..." }));
-    main.appendChild(wrap);
+    for (const [path, rec] of cachedEntries) {
+      filesByPath.set(path, rec);
+      if (!treeChildren.has(rec.parentPath)) treeChildren.set(rec.parentPath, []);
+      if (!treeChildren.get(rec.parentPath).includes(path)) treeChildren.get(rec.parentPath).push(path);
+      if (rec.isFolder && !treeChildren.has(path)) treeChildren.set(path, []);
+      if (!rec.isFolder && path.toLowerCase().endsWith(".md")) {
+        const base = rec.name.replace(/\.[^.]+$/, "").toLowerCase();
+        if (!nameIndex.has(base)) nameIndex.set(base, path);
+      }
+    }
+    for (const [path] of cachedLoaded) loadedFolders.add(path);
+    for (const [, children] of treeChildren) {
+      children.sort((a, b) => {
+        const fa = filesByPath.get(a), fb = filesByPath.get(b);
+        const af = fa.isFolder ? 0 : 1, bf = fb.isFolder ? 0 : 1;
+        if (af !== bf) return af - bf;
+        return fa.name.localeCompare(fb.name, "es");
+      });
+    }
   } else {
-    showLoading("Leyendo tu vault (primera vez, puede tardar)...");
+    showLoading("Leyendo tu vault...");
   }
 
-  filesByPath = new Map(); treeChildren = new Map(); treeChildren.set("", []); nameIndex = new Map();
   try {
-    await walkVaultConcurrent(rootFolder.id, "");
+    await fetchFolderChildren(""); // solo el nivel raiz: rapido, el resto se carga al desplegar cada carpeta
   } catch (e) {
     if (!showedCached) {
       main.innerHTML = "";
       main.appendChild(el("div", { class: "empty", text: "Error leyendo el vault: " + e.message }));
-    } else {
-      toast("No se pudo actualizar desde Drive (sigues viendo la version guardada): " + e.message, true);
+      return;
     }
-    return;
+    toast("No se pudo actualizar la carpeta raiz desde Drive: " + e.message, true);
   }
-
-  idbClearAll().then(async () => {
-    for (const [path, file] of filesByPath) await idbSet("tree", path, file);
-  });
 
   vaultNameEl.textContent = rootFolder.name;
   $("sidebarEmail").textContent = currentUserEmail || "";
   renderTree();
-  if (!showedCached || activeTab === -1) {
-    if (!showedCached) { tabs = []; activeTab = -1; renderTabBar(); }
+  if (!showedCached) {
+    tabs = []; activeTab = -1;
+    renderTabBar();
     main.innerHTML = "";
     topbarActions.innerHTML = "";
     const wrap = el("div", { class: "center-screen" });
@@ -1112,18 +1111,47 @@ function buildTreeNode(path) {
   const row = el("div", { class: "tree-row" });
 
   if (file.isFolder) {
-    const collapsed = collapsedFolders.has(path);
-    row.classList.toggle("collapsed", collapsed);
+    const expanded = expandedFolders.has(path);
+    row.classList.toggle("collapsed", !expanded);
     row.appendChild(el("span", { class: "chev", text: "▾" }));
     row.appendChild(el("span", { class: "name", text: "📁 " + file.name }));
-    const childrenWrap = el("div", { class: "tree-children" + (collapsed ? " hidden" : "") });
-    for (const childPath of treeChildren.get(path) || []) childrenWrap.appendChild(buildTreeNode(childPath));
-    row.addEventListener("click", () => {
-      const nowCollapsed = childrenWrap.classList.toggle("hidden");
-      row.classList.toggle("collapsed", nowCollapsed);
-      if (nowCollapsed) collapsedFolders.add(path); else collapsedFolders.delete(path);
-    });
+    const childrenWrap = el("div", { class: "tree-children" + (expanded ? "" : " hidden") });
     item.appendChild(row); item.appendChild(childrenWrap);
+
+    let built = false;
+    async function ensureChildren() {
+      if (built) return;
+      built = true;
+      if (!loadedFolders.has(path)) {
+        const spinner = el("div", { class: "empty", text: "Cargando..." });
+        spinner.style.padding = "6px 8px";
+        childrenWrap.appendChild(spinner);
+        try {
+          await fetchFolderChildren(path);
+        } catch (e) {
+          spinner.textContent = "Error: " + e.message;
+          return;
+        }
+        childrenWrap.removeChild(spinner);
+      }
+      for (const childPath of treeChildren.get(path) || []) childrenWrap.appendChild(buildTreeNode(childPath));
+    }
+
+    if (expanded) ensureChildren();
+
+    row.addEventListener("click", async () => {
+      const isHidden = childrenWrap.classList.contains("hidden");
+      if (isHidden) {
+        row.classList.remove("collapsed");
+        childrenWrap.classList.remove("hidden");
+        expandedFolders.add(path);
+        await ensureChildren();
+      } else {
+        childrenWrap.classList.add("hidden");
+        row.classList.add("collapsed");
+        expandedFolders.delete(path);
+      }
+    });
   } else {
     const isMd = file.name.toLowerCase().endsWith(".md");
     const icon = isMd ? "📄" : /\.(png|jpe?g|gif|webp|svg)$/i.test(file.name) ? "🖼️" : "📎";
@@ -1290,9 +1318,10 @@ function renderNote() {
     const pendingImages = [];
     const pendingCharts = [];
     const pendingScripts = [];
+    const pendingLinks = [];
     let counter = 0;
     const ctx = {
-      onWikilink: (target, alias) => renderWikilink(target, alias),
+      onWikilink: (target, alias) => renderWikilink(target, alias, pendingLinks, () => counter++),
       onEmbed: (target, alias) => renderEmbed(target, alias, pendingImages, () => counter++),
       onImage: (url, alt) => renderInlineImage(url, alt, pendingImages, () => counter++, tab.path),
       onChart: (yamlText) => renderChartPlaceholder(yamlText, pendingCharts, () => counter++),
@@ -1312,17 +1341,44 @@ function renderNote() {
 
     resolvePendingImages(pendingImages);
     resolvePendingCharts(pendingCharts);
+    resolvePendingLinks(pendingLinks);
     for (const p of pendingScripts) runDataviewJs(p.code, p.holderId);
   }
 
   main.appendChild(wrap);
 }
 
-function renderWikilink(target, alias) {
+function renderWikilink(target, alias, pendingLinks, nextId) {
   const path = nameIndex.get(target.toLowerCase());
   const label = mdEscapeHtml(alias || target);
-  if (!path) return `<a href="#" class="wikilink broken" title="Nota no encontrada">${label}</a>`;
-  return `<a href="#" class="wikilink" data-open="${mdEscapeHtml(path)}">${label}</a>`;
+  if (path) return `<a href="#" class="wikilink" data-open="${mdEscapeHtml(path)}">${label}</a>`;
+  const linkId = "wl-" + nextId();
+  pendingLinks.push({ linkId, target });
+  return `<a href="#" class="wikilink broken" id="${linkId}" title="Buscando...">${label}</a>`;
+}
+
+// Los enlaces que no estaban ya cargados se resuelven de fondo con una busqueda directa
+// en Drive (rapido: no hace falta recorrer todas las carpetas del vault).
+async function resolvePendingLinks(pending) {
+  for (const p of pending) {
+    try {
+      const already = nameIndex.get(p.target.toLowerCase());
+      let path = already;
+      if (!path) {
+        const matches = await driveSearchByName(p.target + ".md", true);
+        if (matches.length > 0) path = await resolveFilePath(matches[0]);
+      }
+      const a = document.getElementById(p.linkId);
+      if (!a) continue;
+      if (path) {
+        a.classList.remove("broken");
+        a.setAttribute("data-open", path);
+        a.title = "";
+      } else {
+        a.title = "Nota no encontrada";
+      }
+    } catch (e) { /* si falla la busqueda, el enlace se queda marcado como no encontrado */ }
+  }
 }
 
 function renderEmbed(target, alias, pendingImages, nextId) {
@@ -1427,23 +1483,49 @@ async function saveTab(tab, btn) {
 
 /* ---------------- Busqueda ---------------- */
 
+function renderSearchRow(name, path, isMd) {
+  const row = el("div", { class: "tree-row" });
+  const icon = isMd ? "📄" : "📎";
+  row.appendChild(el("span", { class: "chev", text: "" }));
+  row.appendChild(el("span", { class: "name", text: icon + " " + path }));
+  row.addEventListener("click", () => {
+    closeSidebar(); $("searchInput").value = ""; renderTree();
+    if (isMd) openNote(path); else openOther(path);
+  });
+  treeEl.appendChild(row);
+}
+
+let searchDebounce = null;
 $("searchInput").addEventListener("input", (ev) => {
-  const q = ev.target.value.trim().toLowerCase();
+  const q = ev.target.value.trim();
   if (!q) { renderTree(); return; }
+  const qLower = q.toLowerCase();
   treeEl.innerHTML = "";
-  const matches = [...filesByPath.values()].filter((f) => !f.isFolder && f.name.toLowerCase().includes(q)).sort((a, b) => a.name.localeCompare(b.name, "es"));
-  if (matches.length === 0) { treeEl.appendChild(el("div", { class: "empty", text: "Sin resultados." })); return; }
-  for (const f of matches) {
-    const row = el("div", { class: "tree-row" });
-    const icon = f.name.toLowerCase().endsWith(".md") ? "📄" : "📎";
-    row.appendChild(el("span", { class: "chev", text: "" }));
-    row.appendChild(el("span", { class: "name", text: icon + " " + f.path }));
-    row.addEventListener("click", () => {
-      closeSidebar(); ev.target.value = ""; renderTree();
-      if (f.name.toLowerCase().endsWith(".md")) openNote(f.path); else openOther(f.path);
-    });
-    treeEl.appendChild(row);
-  }
+  const seenPaths = new Set();
+  const localMatches = [...filesByPath.values()].filter((f) => !f.isFolder && f.name.toLowerCase().includes(qLower)).sort((a, b) => a.name.localeCompare(b.name, "es"));
+  if (localMatches.length === 0) treeEl.appendChild(el("div", { class: "empty", text: "Buscando en Drive..." }));
+  for (const f of localMatches) { seenPaths.add(f.path); renderSearchRow(f.name, f.path, f.name.toLowerCase().endsWith(".md")); }
+
+  clearTimeout(searchDebounce);
+  searchDebounce = setTimeout(async () => {
+    if ($("searchInput").value.trim() !== q) return; // el usuario siguio escribiendo
+    try {
+      const remote = await driveSearchByName(q, false);
+      if ($("searchInput").value.trim() !== q) return;
+      const empty = treeEl.querySelector(".empty");
+      if (empty) empty.remove();
+      for (const file of remote) {
+        if (file.mimeType === FOLDER_MIME) continue;
+        const path = await resolveFilePath(file);
+        if (seenPaths.has(path)) continue;
+        seenPaths.add(path);
+        renderSearchRow(file.name, path, file.name.toLowerCase().endsWith(".md"));
+      }
+      if (seenPaths.size === 0) treeEl.appendChild(el("div", { class: "empty", text: "Sin resultados." }));
+    } catch (e) {
+      if (seenPaths.size === 0) treeEl.appendChild(el("div", { class: "empty", text: "Sin resultados locales (y fallo la busqueda en Drive)." }));
+    }
+  }, 350);
 });
 
 $("logoutBtn").addEventListener("click", logout);
