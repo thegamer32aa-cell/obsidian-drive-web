@@ -561,7 +561,9 @@ async function prefetchForScript(code) {
     if (contentCache.has(p)) return;
     const file = filesByPath.get(p);
     try {
-      const content = await downloadText(file.id);
+      const cached = await idbGet("content", file.id);
+      const content = cached !== undefined ? cached : await downloadText(file.id);
+      if (cached === undefined) idbSet("content", file.id, content);
       contentCache.set(p, content);
       frontmatterCache.set(p, parseFrontmatterBlock(content).fm);
     } catch (e) { /* si un archivo falla, seguimos con el resto */ }
@@ -708,6 +710,74 @@ let activeTab = -1;
 let chartInstances = [];
 let contentCache = new Map();      // path -> texto crudo (cache para dataviewjs)
 let frontmatterCache = new Map();  // path -> objeto frontmatter parseado
+
+/* ---------------------------------------------------------------------
+   Cache local (IndexedDB): el arbol del vault y el texto de las notas se
+   guardan en el propio dispositivo. Al abrir la app se pinta todo al
+   instante desde esta cache, y Drive solo se consulta de fondo para
+   traer cambios (no bloquea nada).
+--------------------------------------------------------------------- */
+const IDB_NAME = "ovd_cache_v1";
+let idbPromise = null;
+
+function idbOpen() {
+  if (idbPromise) return idbPromise;
+  idbPromise = new Promise((resolve, reject) => {
+    if (!window.indexedDB) { resolve(null); return; }
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains("tree")) db.createObjectStore("tree");
+      if (!db.objectStoreNames.contains("content")) db.createObjectStore("content");
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => resolve(null);
+  });
+  return idbPromise;
+}
+async function idbGet(store, key) {
+  const db = await idbOpen();
+  if (!db) return undefined;
+  return new Promise((resolve) => {
+    const tx = db.transaction(store, "readonly").objectStore(store).get(key);
+    tx.onsuccess = () => resolve(tx.result);
+    tx.onerror = () => resolve(undefined);
+  });
+}
+async function idbSet(store, key, value) {
+  const db = await idbOpen();
+  if (!db) return;
+  return new Promise((resolve) => {
+    const tx = db.transaction(store, "readwrite").objectStore(store).put(value, key);
+    tx.onsuccess = () => resolve();
+    tx.onerror = () => resolve();
+  });
+}
+async function idbGetAll(store) {
+  const db = await idbOpen();
+  if (!db) return [];
+  return new Promise((resolve) => {
+    const os = db.transaction(store, "readonly").objectStore(store);
+    const keysReq = os.getAllKeys();
+    const valsReq = os.getAll();
+    keysReq.onsuccess = () => {
+      valsReq.onsuccess = () => resolve(keysReq.result.map((k, i) => [k, valsReq.result[i]]));
+      valsReq.onerror = () => resolve([]);
+    };
+    keysReq.onerror = () => resolve([]);
+  });
+}
+async function idbClearAll() {
+  const db = await idbOpen();
+  if (!db) return;
+  return new Promise((resolve) => {
+    const tx = db.transaction(["tree", "content"], "readwrite");
+    tx.objectStore("tree").clear();
+    tx.objectStore("content").clear();
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => resolve();
+  });
+}
 
 const $ = (id) => document.getElementById(id);
 const main = $("main");
@@ -873,6 +943,7 @@ async function openPicker() {
 function changeFolder() {
   localStorage.removeItem(STORAGE_FOLDER_KEY);
   rootFolder = null; tabs = []; activeTab = -1;
+  idbClearAll();
   showFolderPicker();
 }
 $("changeFolderBtn").addEventListener("click", changeFolder);
@@ -955,28 +1026,79 @@ function walkVaultConcurrent(rootId, rootPath) {
   });
 }
 
-async function loadVault() {
-  showLoading("Leyendo tu vault...");
-  filesByPath = new Map(); nameIndex = new Map(); treeChildren = new Map();
+function rebuildIndexesFromFiles() {
+  nameIndex = new Map();
+  treeChildren = new Map();
   treeChildren.set("", []);
+  for (const f of filesByPath.values()) {
+    if (!treeChildren.has(f.parentPath)) treeChildren.set(f.parentPath, []);
+    treeChildren.get(f.parentPath).push(f.path);
+    if (f.isFolder && !treeChildren.has(f.path)) treeChildren.set(f.path, []);
+    if (!f.isFolder && f.path.toLowerCase().endsWith(".md")) {
+      const base = f.name.replace(/\.[^.]+$/, "").toLowerCase();
+      if (!nameIndex.has(base)) nameIndex.set(base, f.path);
+    }
+  }
+  for (const [, children] of treeChildren) {
+    children.sort((a, b) => {
+      const fa = filesByPath.get(a), fb = filesByPath.get(b);
+      const af = fa.isFolder ? 0 : 1, bf = fb.isFolder ? 0 : 1;
+      if (af !== bf) return af - bf;
+      return fa.name.localeCompare(fb.name, "es");
+    });
+  }
+}
+
+async function loadVault() {
+  const cachedEntries = await idbGetAll("tree");
+  const showedCached = cachedEntries.length > 0;
+
+  if (showedCached) {
+    filesByPath = new Map(cachedEntries);
+    rebuildIndexesFromFiles();
+    vaultNameEl.textContent = rootFolder.name;
+    $("sidebarEmail").textContent = currentUserEmail || "";
+    renderTree();
+    tabs = []; activeTab = -1;
+    renderTabBar();
+    main.innerHTML = "";
+    topbarActions.innerHTML = "";
+    const wrap = el("div", { class: "center-screen" });
+    wrap.appendChild(el("p", { text: "Selecciona una nota del menu para empezar." }));
+    wrap.appendChild(el("p", { text: "Actualizando desde Drive..." }));
+    main.appendChild(wrap);
+  } else {
+    showLoading("Leyendo tu vault (primera vez, puede tardar)...");
+  }
+
+  filesByPath = new Map(); treeChildren = new Map(); treeChildren.set("", []); nameIndex = new Map();
   try {
     await walkVaultConcurrent(rootFolder.id, "");
   } catch (e) {
-    main.innerHTML = "";
-    main.appendChild(el("div", { class: "empty", text: "Error leyendo el vault: " + e.message }));
+    if (!showedCached) {
+      main.innerHTML = "";
+      main.appendChild(el("div", { class: "empty", text: "Error leyendo el vault: " + e.message }));
+    } else {
+      toast("No se pudo actualizar desde Drive (sigues viendo la version guardada): " + e.message, true);
+    }
     return;
   }
+
+  idbClearAll().then(async () => {
+    for (const [path, file] of filesByPath) await idbSet("tree", path, file);
+  });
 
   vaultNameEl.textContent = rootFolder.name;
   $("sidebarEmail").textContent = currentUserEmail || "";
   renderTree();
-  tabs = []; activeTab = -1;
-  renderTabBar();
-  main.innerHTML = "";
-  topbarActions.innerHTML = "";
-  const wrap = el("div", { class: "center-screen" });
-  wrap.appendChild(el("p", { text: "Selecciona una nota del menu para empezar." }));
-  main.appendChild(wrap);
+  if (!showedCached || activeTab === -1) {
+    if (!showedCached) { tabs = []; activeTab = -1; renderTabBar(); }
+    main.innerHTML = "";
+    topbarActions.innerHTML = "";
+    const wrap = el("div", { class: "center-screen" });
+    wrap.appendChild(el("p", { text: "Selecciona una nota del menu para empezar." }));
+    main.appendChild(wrap);
+  }
 }
 
 function renderTree() {
@@ -1055,9 +1177,25 @@ async function openNote(path) {
   if (existingIdx !== -1) { setActiveTab(existingIdx); return; }
   const file = filesByPath.get(path);
   if (!file) { toast("Nota no encontrada: " + path, true); return; }
+
+  const cached = await idbGet("content", file.id);
+  if (cached !== undefined) {
+    // Apertura instantanea desde la cache local; Drive se consulta de fondo.
+    contentCache.set(path, cached);
+    const tab = { path, id: file.id, content: cached, dirty: false, viewMode: "preview" };
+    tabs.push(tab);
+    activeTab = tabs.length - 1;
+    renderTabBar();
+    renderNote();
+    refreshNoteInBackground(tab, file);
+    return;
+  }
+
   showLoading("Abriendo " + file.name + "...");
   try {
     const content = await downloadText(file.id);
+    contentCache.set(path, content);
+    idbSet("content", file.id, content);
     tabs.push({ path, id: file.id, content, dirty: false, viewMode: "preview" });
     activeTab = tabs.length - 1;
     renderTabBar();
@@ -1066,6 +1204,18 @@ async function openNote(path) {
     main.innerHTML = "";
     main.appendChild(el("div", { class: "empty", text: "Error abriendo la nota: " + e.message }));
   }
+}
+
+async function refreshNoteInBackground(tab, file) {
+  try {
+    const fresh = await downloadText(file.id);
+    idbSet("content", file.id, fresh);
+    if (fresh === tab.content) return;
+    if (tab.dirty) return; // no pisar ediciones sin guardar
+    tab.content = fresh;
+    contentCache.set(tab.path, fresh);
+    if (tabs[activeTab] === tab) renderNote();
+  } catch (e) { /* sin conexion o error puntual: seguimos con lo que ya se ve */ }
 }
 
 async function openOther(path) {
@@ -1264,6 +1414,8 @@ async function saveTab(tab, btn) {
   try {
     await uploadText(tab.id, tab.content);
     tab.dirty = false;
+    contentCache.set(tab.path, tab.content);
+    idbSet("content", tab.id, tab.content);
     renderTabBar();
     toast("Guardado.");
     if (activeTab !== -1 && tabs[activeTab] === tab) renderNote();
