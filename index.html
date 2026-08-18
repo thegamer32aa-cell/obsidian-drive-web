@@ -907,32 +907,60 @@ async function uploadText(fileId, text) {
   });
 }
 
+function walkVaultConcurrent(rootId, rootPath) {
+  const CONCURRENCY = 6;
+  const queue = [{ id: rootId, path: rootPath }];
+  let active = 0;
+
+  return new Promise((resolve, reject) => {
+    let failed = false;
+
+    function processFolder(item) {
+      active++;
+      listChildrenOf(item.id)
+        .then((children) => {
+          children.sort((a, b) => {
+            const af = a.mimeType === FOLDER_MIME ? 0 : 1, bf = b.mimeType === FOLDER_MIME ? 0 : 1;
+            if (af !== bf) return af - bf;
+            return a.name.localeCompare(b.name, "es");
+          });
+          for (const child of children) {
+            const childPath = item.path ? item.path + "/" + child.name : child.name;
+            const isFolder = child.mimeType === FOLDER_MIME;
+            filesByPath.set(childPath, { id: child.id, name: child.name, mimeType: child.mimeType, modifiedTime: child.modifiedTime, path: childPath, parentPath: item.path, isFolder });
+            treeChildren.get(item.path).push(childPath);
+            if (isFolder) {
+              treeChildren.set(childPath, []);
+              queue.push({ id: child.id, path: childPath });
+            } else {
+              const base = child.name.replace(/\.[^.]+$/, "").toLowerCase();
+              if (!nameIndex.has(base)) nameIndex.set(base, childPath);
+            }
+          }
+          active--;
+          pump();
+        })
+        .catch((e) => {
+          if (!failed) { failed = true; reject(e); }
+        });
+    }
+
+    function pump() {
+      if (failed) return;
+      while (active < CONCURRENCY && queue.length) processFolder(queue.shift());
+      if (!failed && active === 0 && queue.length === 0) resolve();
+    }
+
+    pump();
+  });
+}
+
 async function loadVault() {
   showLoading("Leyendo tu vault...");
   filesByPath = new Map(); nameIndex = new Map(); treeChildren = new Map();
   treeChildren.set("", []);
   try {
-    const queue = [{ id: rootFolder.id, path: "" }];
-    while (queue.length) {
-      const { id, path } = queue.shift();
-      const children = await listChildrenOf(id);
-      children.sort((a, b) => {
-        const af = a.mimeType === FOLDER_MIME ? 0 : 1, bf = b.mimeType === FOLDER_MIME ? 0 : 1;
-        if (af !== bf) return af - bf;
-        return a.name.localeCompare(b.name, "es");
-      });
-      for (const child of children) {
-        const childPath = path ? path + "/" + child.name : child.name;
-        const isFolder = child.mimeType === FOLDER_MIME;
-        filesByPath.set(childPath, { id: child.id, name: child.name, mimeType: child.mimeType, modifiedTime: child.modifiedTime, path: childPath, parentPath: path, isFolder });
-        treeChildren.get(path).push(childPath);
-        if (isFolder) { treeChildren.set(childPath, []); queue.push({ id: child.id, path: childPath }); }
-        else {
-          const base = child.name.replace(/\.[^.]+$/, "").toLowerCase();
-          if (!nameIndex.has(base)) nameIndex.set(base, childPath);
-        }
-      }
-    }
+    await walkVaultConcurrent(rootFolder.id, "");
   } catch (e) {
     main.innerHTML = "";
     main.appendChild(el("div", { class: "empty", text: "Error leyendo el vault: " + e.message }));
