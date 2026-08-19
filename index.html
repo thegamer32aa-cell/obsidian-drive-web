@@ -72,7 +72,16 @@ button{font:inherit;}
 .icon-btn{background:none;border:1px solid transparent;color:var(--fg);border-radius:6px;
   width:36px;height:36px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:1.05rem;cursor:pointer;}
 .icon-btn:hover{background:var(--bg-elevated);}
+.icon-btn-wide{width:auto;padding:0 8px;font-size:.85rem;}
 .only-mobile{display:none;}
+
+.ctx-menu{position:fixed;z-index:60;background:var(--bg-elevated);border:1px solid var(--border);
+  border-radius:8px;padding:4px;min-width:180px;box-shadow:0 8px 24px rgba(0,0,0,.4);}
+.ctx-menu button{display:block;width:100%;text-align:left;background:none;border:none;color:var(--fg);
+  padding:9px 12px;border-radius:6px;font-size:.9rem;cursor:pointer;}
+.ctx-menu button:hover{background:var(--bg-secondary);}
+.ctx-menu button.danger{color:var(--danger);}
+.ctx-menu-scrim{position:fixed;inset:0;z-index:59;}
 
 .tabbar{flex:1;display:flex;gap:4px;overflow-x:auto;scrollbar-width:none;min-width:0;}
 .tabbar::-webkit-scrollbar{display:none;}
@@ -157,6 +166,8 @@ button.pill:disabled{opacity:.5;}
     <div class="sidebar-header">
       <button id="sidebarCloseBtn" class="icon-btn only-mobile" aria-label="Cerrar">✕</button>
       <div class="vault-name" id="vaultName">Vault</div>
+      <button id="newNoteBtn" class="icon-btn" title="Nueva nota">📝</button>
+      <button id="newFolderBtn" class="icon-btn icon-btn-wide" title="Nueva carpeta">📁+</button>
       <button id="changeFolderBtn" class="icon-btn" title="Cambiar carpeta">📂</button>
     </div>
     <div class="sidebar-search">
@@ -594,14 +605,30 @@ async function prefetchForScript(code) {
     }
   }
   await Promise.all([...paths].map(async (p) => {
-    if (contentCache.has(p)) return;
+    if (frontmatterCache.has(p)) return;
     const file = filesByPath.get(p);
     try {
-      const cached = await idbGet("content", file.id);
-      const content = cached !== undefined ? cached : await downloadText(file.id);
-      if (cached === undefined) idbSet("content", file.id, content);
-      contentCache.set(p, content);
-      frontmatterCache.set(p, parseFrontmatterBlock(content).fm);
+      // Si ya tenemos el contenido completo (se abrio como nota, o cache de una sesion anterior), lo usamos.
+      const fullCached = contentCache.get(p) ?? (await idbGet("content", file.id));
+      if (fullCached !== undefined) {
+        contentCache.set(p, fullCached);
+        frontmatterCache.set(p, parseFrontmatterBlock(fullCached).fm);
+        return;
+      }
+      const fmCached = await idbGet("fm", file.id);
+      if (fmCached !== undefined) { frontmatterCache.set(p, fmCached); return; }
+
+      const { text, complete } = await fetchFrontmatterOnly(file.id);
+      if (complete) {
+        const fm = parseFrontmatterBlock(text).fm;
+        frontmatterCache.set(p, fm);
+        idbSet("fm", file.id, fm);
+      } else {
+        const content = await downloadText(file.id);
+        contentCache.set(p, content);
+        idbSet("content", file.id, content);
+        frontmatterCache.set(p, parseFrontmatterBlock(content).fm);
+      }
     } catch (e) { /* si un archivo falla, seguimos con el resto */ }
   }));
 }
@@ -765,12 +792,13 @@ function idbOpen() {
   if (idbPromise) return idbPromise;
   idbPromise = new Promise((resolve, reject) => {
     if (!window.indexedDB) { resolve(null); return; }
-    const req = indexedDB.open(IDB_NAME, 1);
+    const req = indexedDB.open(IDB_NAME, 2);
     req.onupgradeneeded = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains("tree")) db.createObjectStore("tree");
       if (!db.objectStoreNames.contains("content")) db.createObjectStore("content");
       if (!db.objectStoreNames.contains("loaded")) db.createObjectStore("loaded");
+      if (!db.objectStoreNames.contains("fm")) db.createObjectStore("fm");
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => resolve(null);
@@ -813,10 +841,11 @@ async function idbClearAll() {
   const db = await idbOpen();
   if (!db) return;
   return new Promise((resolve) => {
-    const tx = db.transaction(["tree", "content", "loaded"], "readwrite");
+    const tx = db.transaction(["tree", "content", "loaded", "fm"], "readwrite");
     tx.objectStore("tree").clear();
     tx.objectStore("content").clear();
     tx.objectStore("loaded").clear();
+    tx.objectStore("fm").clear();
     tx.oncomplete = () => resolve();
     tx.onerror = () => resolve();
   });
@@ -990,6 +1019,8 @@ function changeFolder() {
   showFolderPicker();
 }
 $("changeFolderBtn").addEventListener("click", changeFolder);
+$("newNoteBtn").addEventListener("click", () => createNote(""));
+$("newFolderBtn").addEventListener("click", () => createFolder(""));
 
 async function driveFetch(url, opts) {
   opts = opts || {};
@@ -1077,6 +1108,19 @@ async function resolveFilePath(file) {
 }
 
 async function downloadText(fileId) { const res = await driveFetch(`${DRIVE_API}/files/${encodeURIComponent(fileId)}?alt=media`); return res.text(); }
+
+// Trae solo los primeros bytes de un archivo (las propiedades --- --- siempre van al principio).
+// Mucho mas ligero que bajar la nota entera cuando solo hace falta leer su frontmatter.
+async function fetchFrontmatterOnly(fileId) {
+  const res = await fetch(`${DRIVE_API}/files/${encodeURIComponent(fileId)}?alt=media`, {
+    headers: { Authorization: "Bearer " + accessToken, Range: "bytes=0-2047" },
+  });
+  if (res.status === 401) { revokeToken(); showLogin("Tu sesion caduco, inicia sesion de nuevo."); throw new Error("sesion caducada"); }
+  if (!res.ok && res.status !== 206) throw new Error("Drive API " + res.status);
+  const text = await res.text();
+  const complete = res.status !== 206 || /\r?\n---\r?\n/.test(text.slice(3));
+  return { text, complete };
+}
 async function downloadBlob(fileId) { const res = await driveFetch(`${DRIVE_API}/files/${encodeURIComponent(fileId)}?alt=media`); return res.blob(); }
 async function uploadText(fileId, text) {
   await driveFetch(`https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(fileId)}?uploadType=media`, {
@@ -1200,7 +1244,214 @@ function buildTreeNode(path) {
     row.addEventListener("click", () => { closeSidebar(); if (isMd) openNote(path); else openOther(path); });
     item.appendChild(row);
   }
+  attachContextMenu(row, path);
   return item;
+}
+
+/* ---------------- Menu contextual (mantener pulsado / clic derecho) ---------------- */
+
+function attachContextMenu(row, path) {
+  row.addEventListener("contextmenu", (ev) => { ev.preventDefault(); openContextMenu(path, ev.clientX, ev.clientY); });
+  let pressTimer = null, longPressed = false, startX = 0, startY = 0;
+  row.addEventListener("touchstart", (ev) => {
+    longPressed = false;
+    const t = ev.touches[0];
+    startX = t.clientX; startY = t.clientY;
+    pressTimer = setTimeout(() => {
+      longPressed = true;
+      if (navigator.vibrate) navigator.vibrate(15);
+      openContextMenu(path, startX, startY);
+    }, 550);
+  }, { passive: true });
+  row.addEventListener("touchmove", (ev) => {
+    const t = ev.touches[0];
+    if (Math.abs(t.clientX - startX) > 8 || Math.abs(t.clientY - startY) > 8) clearTimeout(pressTimer);
+  }, { passive: true });
+  row.addEventListener("touchend", () => { clearTimeout(pressTimer); }, { passive: true });
+  row.addEventListener("click", (ev) => { if (longPressed) { ev.stopPropagation(); ev.preventDefault(); longPressed = false; } }, true);
+}
+
+function closeContextMenu() {
+  document.querySelectorAll(".ctx-menu, .ctx-menu-scrim").forEach((n) => n.remove());
+}
+
+function openContextMenu(path, x, y) {
+  closeContextMenu();
+  const file = filesByPath.get(path);
+  if (!file) return;
+
+  const scrim = el("div", { class: "ctx-menu-scrim", onclick: closeContextMenu });
+  document.body.appendChild(scrim);
+
+  const menu = el("div", { class: "ctx-menu" });
+  const actions = [];
+  if (file.isFolder) {
+    actions.push(["📝 Nueva nota aqui", () => { closeContextMenu(); createNote(path); }]);
+    actions.push(["📁 Nueva subcarpeta", () => { closeContextMenu(); createFolder(path); }]);
+  }
+  actions.push(["✏️ Renombrar", () => { closeContextMenu(); renameItem(path); }]);
+  actions.push(["🗑️ Eliminar", () => { closeContextMenu(); deleteItem(path); }]);
+
+  for (const [label, handler] of actions) menu.appendChild(el("button", { text: label, onclick: handler }));
+  document.body.appendChild(menu);
+
+  const rect = menu.getBoundingClientRect();
+  const maxX = window.innerWidth - rect.width - 8;
+  const maxY = window.innerHeight - rect.height - 8;
+  menu.style.left = Math.max(8, Math.min(x, maxX)) + "px";
+  menu.style.top = Math.max(8, Math.min(y, maxY)) + "px";
+}
+
+/* ---------------- Crear / renombrar / borrar ---------------- */
+
+function removeLocalPath(path) {
+  const file = filesByPath.get(path);
+  if (!file) return;
+  if (file.isFolder) {
+    for (const childPath of (treeChildren.get(path) || []).slice()) removeLocalPath(childPath);
+    treeChildren.delete(path);
+    loadedFolders.delete(path);
+  }
+  filesByPath.delete(path);
+  const siblings = treeChildren.get(file.parentPath);
+  if (siblings) { const i = siblings.indexOf(path); if (i !== -1) siblings.splice(i, 1); }
+  for (const [name, p] of nameIndex) if (p === path) nameIndex.delete(name);
+  contentCache.delete(path); frontmatterCache.delete(path);
+  idbOpen().then((db) => {
+    if (!db) return;
+    const tx = db.transaction(["tree", "content", "loaded", "fm"], "readwrite");
+    tx.objectStore("tree").delete(path);
+    tx.objectStore("content").delete(file.id);
+    tx.objectStore("loaded").delete(path);
+    tx.objectStore("fm").delete(file.id);
+  });
+  const openIdx = tabs.findIndex((t) => t.path === path);
+  if (openIdx !== -1) closeTab(openIdx);
+}
+
+async function createNote(parentPath) {
+  const name = prompt("Nombre de la nueva nota:", "Nueva nota");
+  if (!name) return;
+  const fileName = name.toLowerCase().endsWith(".md") ? name : name + ".md";
+  const path = parentPath ? parentPath + "/" + fileName : fileName;
+  if (filesByPath.has(path)) { toast("Ya existe una nota con ese nombre aqui.", true); return; }
+  try {
+    const folderId = await ensureDriveFolderPath(parentPath);
+    const created = await driveFetch(`${DRIVE_API}/files?fields=id`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: fileName, parents: [folderId] }),
+    }).then((r) => r.json());
+    await uploadText(created.id, "");
+    addFileToIndexes(path, { id: created.id, name: fileName, mimeType: "text/markdown", modifiedTime: new Date().toISOString() }, parentPath);
+    contentCache.set(path, ""); idbSet("content", created.id, "");
+    if (!loadedFolders.has(parentPath)) { loadedFolders.add(parentPath); idbSet("loaded", parentPath, true); }
+    expandedFolders.add(parentPath);
+    renderTree();
+    openNote(path);
+  } catch (e) { toast("No se pudo crear la nota: " + e.message, true); }
+}
+
+async function createFolder(parentPath) {
+  const name = prompt("Nombre de la nueva carpeta:");
+  if (!name) return;
+  const path = parentPath ? parentPath + "/" + name : name;
+  if (filesByPath.has(path)) { toast("Ya existe una carpeta con ese nombre aqui.", true); return; }
+  try {
+    const parentId = await ensureDriveFolderPath(parentPath);
+    const created = await driveFetch(`${DRIVE_API}/files?fields=id`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, mimeType: FOLDER_MIME, parents: [parentId] }),
+    }).then((r) => r.json());
+    addFileToIndexes(path, { id: created.id, name, mimeType: FOLDER_MIME, modifiedTime: new Date().toISOString() }, parentPath);
+    loadedFolders.add(path); idbSet("loaded", path, true);
+    if (!loadedFolders.has(parentPath)) { loadedFolders.add(parentPath); idbSet("loaded", parentPath, true); }
+    expandedFolders.add(parentPath);
+    renderTree();
+  } catch (e) { toast("No se pudo crear la carpeta: " + e.message, true); }
+}
+
+// Devuelve las rutas de todos los descendientes ya cargados de una carpeta (orden de arriba a abajo).
+function collectDescendants(path) {
+  const out = [];
+  for (const childPath of treeChildren.get(path) || []) {
+    out.push(childPath);
+    const rec = filesByPath.get(childPath);
+    if (rec && rec.isFolder) out.push(...collectDescendants(childPath));
+  }
+  return out;
+}
+
+// Mueve un unico nodo ya indexado de oldPath a newPath, conservando su cache y su pestana abierta si la tiene.
+function moveSingleNode(oldPath, newPath) {
+  const rec = filesByPath.get(oldPath);
+  if (!rec) return;
+  const oldSiblings = treeChildren.get(rec.parentPath);
+  if (oldSiblings) { const i = oldSiblings.indexOf(oldPath); if (i !== -1) oldSiblings.splice(i, 1); }
+  filesByPath.delete(oldPath);
+  const wasLoaded = loadedFolders.has(oldPath);
+  if (rec.isFolder) loadedFolders.delete(oldPath);
+  const cachedContent = contentCache.get(oldPath);
+  const cachedFm = frontmatterCache.get(oldPath);
+  contentCache.delete(oldPath); frontmatterCache.delete(oldPath);
+  for (const [n, p] of nameIndex) if (p === oldPath) nameIndex.delete(n);
+  idbOpen().then((db) => {
+    if (!db) return;
+    const tx = db.transaction(["tree", "loaded"], "readwrite");
+    tx.objectStore("tree").delete(oldPath);
+    tx.objectStore("loaded").delete(oldPath);
+  });
+
+  const newParentPath = newPath.includes("/") ? newPath.slice(0, newPath.lastIndexOf("/")) : "";
+  addFileToIndexes(newPath, rec, newParentPath);
+  if (rec.isFolder && wasLoaded) { loadedFolders.add(newPath); idbSet("loaded", newPath, true); }
+  if (cachedContent !== undefined) { contentCache.set(newPath, cachedContent); idbSet("content", rec.id, cachedContent); }
+  if (cachedFm !== undefined) frontmatterCache.set(newPath, cachedFm);
+  const tab = tabs.find((t) => t.path === oldPath);
+  if (tab) tab.path = newPath;
+}
+
+async function renameItem(path) {
+  const file = filesByPath.get(path);
+  const currentLabel = file.isFolder ? file.name : file.name.replace(/\.md$/i, "");
+  const input = prompt("Nuevo nombre:", currentLabel);
+  if (!input || input === currentLabel) return;
+  const newName = !file.isFolder && !input.toLowerCase().endsWith(".md") ? input + ".md" : input;
+  const newPath = file.parentPath ? file.parentPath + "/" + newName : newName;
+  if (filesByPath.has(newPath)) { toast("Ya existe algo con ese nombre ahi.", true); return; }
+  try {
+    await driveFetch(`${DRIVE_API}/files/${encodeURIComponent(file.id)}`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: newName }),
+    });
+    // Recoger los descendientes ANTES de tocar nada, para no perderlos al mover la carpeta.
+    const descendantPaths = file.isFolder ? collectDescendants(path) : [];
+    moveSingleNode(path, newPath);
+    filesByPath.get(newPath).name = newName;
+    for (const oldChildPath of descendantPaths) {
+      const newChildPath = newPath + oldChildPath.slice(path.length);
+      moveSingleNode(oldChildPath, newChildPath);
+    }
+    renderTree();
+    renderTabBar();
+    if (activeTab !== -1 && tabs[activeTab] && tabs[activeTab].path === newPath) renderNote();
+  } catch (e) { toast("No se pudo renombrar: " + e.message, true); }
+}
+
+async function deleteItem(path) {
+  const file = filesByPath.get(path);
+  const label = file.isFolder ? "la carpeta y todo lo que contiene" : "la nota";
+  if (!confirm(`¿Eliminar ${label} "${file.name}"? Se movera a la papelera de Google Drive (se puede recuperar desde ahi).`)) return;
+  try {
+    await driveFetch(`${DRIVE_API}/files/${encodeURIComponent(file.id)}`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ trashed: true }),
+    });
+    removeLocalPath(path);
+    renderTree();
+    if (activeTab === -1) {
+      main.innerHTML = "";
+      const wrap = el("div", { class: "center-screen" });
+      wrap.appendChild(el("p", { text: "Selecciona una nota del menu para empezar." }));
+      main.appendChild(wrap);
+    }
+    toast("Eliminado (en la papelera de Drive).");
+  } catch (e) { toast("No se pudo eliminar: " + e.message, true); }
 }
 
 /* ---------------- Pestanas (tabs) ---------------- */
