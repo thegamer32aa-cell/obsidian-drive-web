@@ -72,6 +72,8 @@ button{font:inherit;}
 .icon-btn{background:none;border:1px solid transparent;color:var(--fg);border-radius:6px;
   width:36px;height:36px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:1.05rem;cursor:pointer;}
 .icon-btn:hover{background:var(--bg-elevated);}
+.icon-btn:disabled{opacity:.35;cursor:default;}
+.icon-btn:disabled:hover{background:none;}
 .icon-btn-wide{width:auto;padding:0 8px;font-size:.85rem;}
 .only-mobile{display:none;}
 
@@ -203,6 +205,8 @@ button.pill:disabled{opacity:.5;}
   <div id="contentCol">
     <header id="topbar">
       <button id="sidebarOpenBtn" class="icon-btn only-mobile" aria-label="Menu">☰</button>
+      <button id="navBackBtn" class="icon-btn" title="Atras" disabled>◀</button>
+      <button id="navFwdBtn" class="icon-btn" title="Adelante" disabled>▶</button>
       <div id="tabbar" class="tabbar"></div>
       <div id="topbarActions"></div>
       <button id="linksToggleBtn" class="icon-btn" title="Enlaces de la nota">🔗</button>
@@ -1000,6 +1004,52 @@ function renderOutgoingLinks(tab) {
   }
 }
 
+/* ---------------- Historial (atras / adelante) ---------------- */
+
+let navHistory = [];
+let navIndex = -1;
+let navigatingViaHistory = false;
+
+function recordHistory(path) {
+  if (navigatingViaHistory) return;
+  if (navHistory[navIndex] === path) return;
+  navHistory = navHistory.slice(0, navIndex + 1);
+  navHistory.push(path);
+  navIndex = navHistory.length - 1;
+  updateNavButtons();
+}
+
+function updateNavButtons() {
+  $("navBackBtn").disabled = navIndex <= 0;
+  $("navFwdBtn").disabled = navIndex >= navHistory.length - 1;
+}
+
+async function navigateToHistoryEntry(path) {
+  const file = filesByPath.get(path);
+  if (!file) { toast("Ese elemento ya no esta disponible.", true); return; }
+  if (file.name.toLowerCase().endsWith(".md")) await openNote(path);
+  else await openOther(path);
+}
+
+async function goBack() {
+  if (navIndex <= 0) return;
+  navIndex--;
+  navigatingViaHistory = true;
+  await navigateToHistoryEntry(navHistory[navIndex]);
+  navigatingViaHistory = false;
+  updateNavButtons();
+}
+async function goForward() {
+  if (navIndex >= navHistory.length - 1) return;
+  navIndex++;
+  navigatingViaHistory = true;
+  await navigateToHistoryEntry(navHistory[navIndex]);
+  navigatingViaHistory = false;
+  updateNavButtons();
+}
+$("navBackBtn").addEventListener("click", goBack);
+$("navFwdBtn").addEventListener("click", goForward);
+
 function showLoading(msg) {
   main.innerHTML = "";
   const wrap = el("div", { class: "center-screen" });
@@ -1151,6 +1201,7 @@ function changeFolder() {
   if (!confirm("¿Cambiar de carpeta? Se borrara todo lo guardado localmente de la carpeta actual (volveras a elegir una y se descargara de nuevo).")) return;
   clearSavedFolder();
   rootFolder = null; tabs = []; activeTab = -1;
+  navHistory = []; navIndex = -1; updateNavButtons();
   idbClearAll();
   showFolderPicker();
 }
@@ -1628,6 +1679,7 @@ function closeTab(idx) {
 /* ---------------- Abrir notas / archivos ---------------- */
 
 async function openNote(path) {
+  recordHistory(path);
   const existingIdx = tabs.findIndex((t) => t.path === path);
   if (existingIdx !== -1) { setActiveTab(existingIdx); return; }
   const file = filesByPath.get(path);
@@ -1674,6 +1726,7 @@ async function refreshNoteInBackground(tab, file) {
 }
 
 async function openOther(path) {
+  recordHistory(path);
   const file = filesByPath.get(path);
   const isImg = /\.(png|jpe?g|gif|webp|svg)$/i.test(file.name);
   topbarActions.innerHTML = "";
