@@ -1265,6 +1265,36 @@ async function fetchFolderChildren(path) {
   idbSet("loaded", path, true);
 }
 
+// Trae TODO el arbol de carpetas desde el inicio (como el explorador de Obsidian), con varias
+// carpetas en paralelo para no ir una por una. Las carpetas ya cargadas (cache) no se repiten.
+function eagerLoadAllFolders() {
+  const CONCURRENCY = 6;
+  const queue = [""];
+  let active = 0;
+  return new Promise((resolve, reject) => {
+    let failed = false;
+    function pump() {
+      if (failed) return;
+      while (active < CONCURRENCY && queue.length) {
+        const path = queue.shift();
+        active++;
+        fetchFolderChildren(path)
+          .then(() => {
+            for (const childPath of treeChildren.get(path) || []) {
+              const rec = filesByPath.get(childPath);
+              if (rec && rec.isFolder && !loadedFolders.has(childPath)) queue.push(childPath);
+            }
+            active--;
+            pump();
+          })
+          .catch((e) => { if (!failed) { failed = true; reject(e); } });
+      }
+      if (!failed && active === 0 && queue.length === 0) resolve();
+    }
+    pump();
+  });
+}
+
 // Busca un archivo por nombre directamente en Drive (sin recorrer carpeta por carpeta).
 // Funciona porque el Picker ya te dio acceso a toda la subcarpeta elegida, no solo a la carpeta en si.
 async function driveSearchByName(nameContains, exact) {
@@ -1343,18 +1373,18 @@ async function loadVault() {
       });
     }
   } else {
-    showLoading("Leyendo tu vault...");
+    showLoading("Leyendo todas las carpetas de tu vault (la primera vez tarda mas)...");
   }
 
   try {
-    await fetchFolderChildren(""); // solo el nivel raiz: rapido, el resto se carga al desplegar cada carpeta
+    await eagerLoadAllFolders();
   } catch (e) {
     if (!showedCached) {
       main.innerHTML = "";
       main.appendChild(el("div", { class: "empty", text: "Error leyendo el vault: " + e.message }));
       return;
     }
-    toast("No se pudo actualizar la carpeta raiz desde Drive: " + e.message, true);
+    toast("No se pudo actualizar todo el vault desde Drive: " + e.message, true);
   }
 
   vaultNameEl.textContent = rootFolder.name;
